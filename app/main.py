@@ -16,8 +16,10 @@ import subprocess
 import tempfile
 import logging
 
+import resend
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr, Field
 
 from app.parsers import aib, clover, clover_fees, elavon, global_payments, intercard, dojo, trust_payments as trustpay
 
@@ -25,6 +27,14 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("statement-checker")
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5MB hard cap
+
+# Per Kos: the client's own copy of their figures is sent via Resend
+# (an account Tavon already has). Requires RESEND_API_KEY to be set as
+# an environment variable on Render, and a "from" address on a domain
+# verified in the Resend dashboard - until both of those are in place,
+# every call to /email-report will fail with a clear 502, not silently.
+resend.api_key = os.environ.get("RESEND_API_KEY", "")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "Tavon Partners <statements@tavonpartners.com>")
 
 app = FastAPI(title="Tavon Partners Statement Checker")
 
@@ -186,3 +196,60 @@ async def analyze_statement(file: UploadFile = File(...)):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+class EmailReportRequest(BaseModel):
+    email: EmailStr
+    provider: str = "—"
+    blended_rate: str = "—"
+    total_fees: str = "—"
+    turnover: str = "—"
+    transaction_count: str = "—"
+    # Cap length defensively - this is free text built client-side from the
+    # fee table, not something that should ever need to be huge.
+    fee_breakdown: str = Field(default="", max_length=20000)
+
+
+@app.post("/email-report")
+async def email_report(req: EmailReportRequest):
+    if not resend.api_key:
+        # Fails loudly rather than pretending to send - RESEND_API_KEY
+        # must be set as an env var on Render for this to work at all.
+        log.error("email-report called but RESEND_API_KEY is not configured.")
+        raise HTTPException(500, "Email delivery is not configured yet - please contact Tavon Partners directly.")
+
+    breakdown_html = "".join(
+        f"<tr><td style='padding:4px 10px 4px 0;white-space:pre'>{line}</td></tr>"
+        for line in req.fee_breakdown.splitlines()
+    ) or "<tr><td>No fee breakdown available.</td></tr>"
+
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;color:#111;max-width:560px">
+      <h2 style="margin:0 0 12px">Your statement breakdown — {req.provider}</h2>
+      <table style="width:100%;border-collapse:collapse;margin-bottom:16px">
+        <tr><td style="padding:4px 10px 4px 0;color:#555">Gross card turnover</td><td>{req.turnover}</td></tr>
+        <tr><td style="padding:4px 10px 4px 0;color:#555">Total fees charged</td><td>{req.total_fees}</td></tr>
+        <tr><td style="padding:4px 10px 4px 0;color:#555">Blended rate</td><td>{req.blended_rate}</td></tr>
+        <tr><td style="padding:4px 10px 4px 0;color:#555">Transactions processed</td><td>{req.transaction_count}</td></tr>
+      </table>
+      <h3 style="margin:0 0 8px">Fee breakdown</h3>
+      <table style="width:100%;border-collapse:collapse;font-size:13px">{breakdown_html}</table>
+      <p style="margin-top:20px;font-size:12px;color:#777">
+        Sent at your request from the Tavon Partners Merchant Statement Checker.
+        This information was not stored on our side.
+      </p>
+    </div>
+    """.strip()
+
+    try:
+        resend.Emails.send({
+            "from": EMAIL_FROM,
+            "to": [req.email],
+            "subject": f"Your {req.provider} statement breakdown — Tavon Partners",
+            "html": html_body,
+        })
+    except Exception as exc:  # noqa: BLE001 - never log the email body/address on failure
+        log.warning("email-report send failed: %s", type(exc).__name__)
+        raise HTTPException(502, "Could not send that email right now - please try again shortly.")
+
+    return {"sent": True}
