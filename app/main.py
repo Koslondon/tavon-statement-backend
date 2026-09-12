@@ -234,7 +234,6 @@ def _pct(n: float | None) -> str:
     return "{:.2f}%".format(abs(n))
 
 
-LOGO_URL = "https://tavonpartners.com/assets/tavon-logo.png"
 
 
 def build_report_email_html(req: "EmailReportRequest") -> str:
@@ -267,7 +266,6 @@ def build_report_email_html(req: "EmailReportRequest") -> str:
               <div style="font-size:19px;font-weight:700;color:#111">{req.provider} Statement</div>
             </td>
             <td style="vertical-align:middle;text-align:right;white-space:nowrap">
-              <img src="{LOGO_URL}" alt="Tavon Partners" width="28" height="28" style="border-radius:50%;vertical-align:middle;margin-right:8px">
               <span style="font-size:14px;font-weight:700;color:#111;letter-spacing:.04em;vertical-align:middle">TAVON PARTNERS</span>
             </td>
           </tr>
