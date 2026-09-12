@@ -28,10 +28,12 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5MB hard cap
 
 app = FastAPI(title="Tavon Partners Statement Checker")
 
-# Restrict this to the real Tavon domain(s) once deployed - see README.
+# Locked to the real Tavon Partners domain (both apex and www, since
+# either can be what the browser sends as Origin depending on how a
+# visitor reaches the site).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: lock to https://tavonpartners.co.uk before go-live
+    allow_origins=["https://tavonpartners.com", "https://www.tavonpartners.com"],
     allow_methods=["POST"],
     allow_headers=["*"],
 )
