@@ -198,16 +198,147 @@ async def health():
     return {"status": "ok"}
 
 
+class EmailFeeRow(BaseModel):
+    label: str
+    volume: float | None = None
+    fee: float | None = None
+    rate_pct: float | None = None
+
+
 class EmailReportRequest(BaseModel):
     email: EmailStr
-    provider: str = "—"
-    blended_rate: str = "—"
-    total_fees: str = "—"
-    turnover: str = "—"
-    transaction_count: str = "—"
-    # Cap length defensively - this is free text built client-side from the
-    # fee table, not something that should ever need to be huge.
-    fee_breakdown: str = Field(default="", max_length=20000)
+    provider: str = "Merchant"
+    # Not yet populated by any parser - no processor currently extracts a
+    # statement date/period from the PDF. Field exists so the email
+    # template is ready for it; falls back to generic wording until that
+    # parsing work is done per-processor.
+    statement_period: str | None = None
+    turnover: float | None = None
+    total_fees: float | None = None
+    blended_rate: float | None = None
+    transaction_count: int | None = None
+    fee_rows: list[EmailFeeRow] = Field(default_factory=list, max_length=200)
+
+
+def _gbp(n: float | None) -> str:
+    """Matches the frontend's fmtGBP: absolute value always, since a fee
+    is never meaningfully negative from the merchant's point of view."""
+    if n is None:
+        return "—"
+    return "£{:,.2f}".format(abs(n))
+
+
+def _pct(n: float | None) -> str:
+    if n is None:
+        return "—"
+    return "{:.2f}%".format(abs(n))
+
+
+LOGO_URL = "https://tavonpartners.com/assets/tavon-logo.png"
+
+
+def build_report_email_html(req: "EmailReportRequest") -> str:
+    period_line = (
+        f"Statement breakdown for {req.statement_period}"
+        if req.statement_period else "Your statement breakdown"
+    )
+
+    fee_rows_html = "".join(
+        f"""<tr>
+              <td style="padding:10px 8px;border-bottom:1px solid #EEE;color:#222;font-size:13.5px">{r.label}</td>
+              <td style="padding:10px 8px;border-bottom:1px solid #EEE;color:#555;font-size:13.5px;text-align:right">{_gbp(r.volume) if r.volume is not None else '—'}</td>
+              <td style="padding:10px 8px;border-bottom:1px solid #EEE;color:#222;font-size:13.5px;text-align:right;font-weight:600">{_gbp(r.fee)}</td>
+              <td style="padding:10px 8px;border-bottom:1px solid #EEE;color:#1E6FD9;font-size:13.5px;text-align:right;font-weight:600">{_pct(r.rate_pct) if r.rate_pct is not None else '—'}</td>
+            </tr>"""
+        for r in req.fee_rows
+    ) or """<tr><td colspan="4" style="padding:14px 8px;color:#888;font-size:13.5px">No fee breakdown available for this statement.</td></tr>"""
+
+    return f"""
+<div style="background:#F4F6F9;padding:28px 12px;font-family:Arial,Helvetica,sans-serif">
+  <table role="presentation" style="max-width:600px;width:100%;margin:0 auto;background:#FFFFFF;border-radius:14px;overflow:hidden;border:1px solid #E4E8EE">
+
+    <!-- Header: processor name + Tavon Partners branding -->
+    <tr>
+      <td style="padding:26px 28px 20px;border-bottom:1px solid #EEE">
+        <table role="presentation" style="width:100%">
+          <tr>
+            <td style="vertical-align:middle">
+              <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#8B96A5;margin-bottom:4px">Statement checker</div>
+              <div style="font-size:19px;font-weight:700;color:#111">{req.provider} Statement</div>
+            </td>
+            <td style="vertical-align:middle;text-align:right;white-space:nowrap">
+              <img src="{LOGO_URL}" alt="Tavon Partners" width="28" height="28" style="border-radius:50%;vertical-align:middle;margin-right:8px">
+              <span style="font-size:14px;font-weight:700;color:#111;letter-spacing:.04em;vertical-align:middle">TAVON PARTNERS</span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+    <!-- Intro + highlighted top-line figures -->
+    <tr>
+      <td style="padding:22px 28px 6px">
+        <div style="font-size:15px;font-weight:600;color:#222;margin-bottom:16px">{period_line}</div>
+        <table role="presentation" style="width:100%;border-spacing:0">
+          <tr>
+            <td style="width:50%;padding:16px;background:#F4F8FF;border-radius:10px;text-align:center">
+              <div style="font-size:20px;font-weight:700;color:#111;font-family:'Courier New',monospace">{_gbp(req.turnover)}</div>
+              <div style="font-size:11.5px;color:#6E7A8C;margin-top:4px">Total revenue this statement</div>
+            </td>
+            <td style="width:12px"></td>
+            <td style="width:50%;padding:16px;background:#F4F8FF;border-radius:10px;text-align:center">
+              <div style="font-size:20px;font-weight:700;color:#111;font-family:'Courier New',monospace">{_gbp(req.total_fees)}</div>
+              <div style="font-size:11.5px;color:#6E7A8C;margin-top:4px">Total fees charged</div>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+    <!-- Fee breakdown table -->
+    <tr>
+      <td style="padding:22px 28px 4px">
+        <div style="font-size:13px;font-weight:700;letter-spacing:.03em;color:#111;text-transform:uppercase;margin-bottom:8px">Fee breakdown</div>
+        <table role="presentation" style="width:100%;border-collapse:collapse">
+          <tr>
+            <th style="text-align:left;padding:6px 8px;font-size:11px;color:#8B96A5;text-transform:uppercase;letter-spacing:.03em;border-bottom:1px solid #DDD">Card type</th>
+            <th style="text-align:right;padding:6px 8px;font-size:11px;color:#8B96A5;text-transform:uppercase;letter-spacing:.03em;border-bottom:1px solid #DDD">Volume</th>
+            <th style="text-align:right;padding:6px 8px;font-size:11px;color:#8B96A5;text-transform:uppercase;letter-spacing:.03em;border-bottom:1px solid #DDD">Fees</th>
+            <th style="text-align:right;padding:6px 8px;font-size:11px;color:#8B96A5;text-transform:uppercase;letter-spacing:.03em;border-bottom:1px solid #DDD">Rate</th>
+          </tr>
+          {fee_rows_html}
+        </table>
+      </td>
+    </tr>
+
+    <!-- Blended rate - the final takeaway, at the very bottom -->
+    <tr>
+      <td style="padding:22px 28px 26px">
+        <table role="presentation" style="width:100%;background:#0E1E33;border-radius:12px">
+          <tr>
+            <td style="padding:20px;text-align:center">
+              <div style="font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:#9CC3F0;margin-bottom:6px">Your blended rate</div>
+              <div style="font-size:30px;font-weight:700;color:#7CC0FF;font-family:'Courier New',monospace">{_pct(req.blended_rate)}</div>
+              <div style="font-size:12px;color:#B9C5D6;margin-top:6px">{('Based on ' + str(req.transaction_count) + ' transactions processed') if req.transaction_count else ''}</div>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+    <!-- Footer -->
+    <tr>
+      <td style="padding:0 28px 26px">
+        <p style="margin:0;font-size:11.5px;line-height:1.6;color:#9AA6B8">
+          Sent at your request from the Tavon Partners Merchant Statement Checker. This information was not stored on our side.
+          Questions? WhatsApp us on <a href="https://wa.me/447584503279" style="color:#1E6FD9">07584 503279</a>.
+        </p>
+      </td>
+    </tr>
+
+  </table>
+</div>
+""".strip()
 
 
 @app.post("/email-report")
@@ -218,28 +349,7 @@ async def email_report(req: EmailReportRequest):
         log.error("email-report called but RESEND_API_KEY is not configured.")
         raise HTTPException(500, "Email delivery is not configured yet - please contact Tavon Partners directly.")
 
-    breakdown_html = "".join(
-        f"<tr><td style='padding:4px 10px 4px 0;white-space:pre'>{line}</td></tr>"
-        for line in req.fee_breakdown.splitlines()
-    ) or "<tr><td>No fee breakdown available.</td></tr>"
-
-    html_body = f"""
-    <div style="font-family:Arial,sans-serif;color:#111;max-width:560px">
-      <h2 style="margin:0 0 12px">Your statement breakdown — {req.provider}</h2>
-      <table style="width:100%;border-collapse:collapse;margin-bottom:16px">
-        <tr><td style="padding:4px 10px 4px 0;color:#555">Gross card turnover</td><td>{req.turnover}</td></tr>
-        <tr><td style="padding:4px 10px 4px 0;color:#555">Total fees charged</td><td>{req.total_fees}</td></tr>
-        <tr><td style="padding:4px 10px 4px 0;color:#555">Blended rate</td><td>{req.blended_rate}</td></tr>
-        <tr><td style="padding:4px 10px 4px 0;color:#555">Transactions processed</td><td>{req.transaction_count}</td></tr>
-      </table>
-      <h3 style="margin:0 0 8px">Fee breakdown</h3>
-      <table style="width:100%;border-collapse:collapse;font-size:13px">{breakdown_html}</table>
-      <p style="margin-top:20px;font-size:12px;color:#777">
-        Sent at your request from the Tavon Partners Merchant Statement Checker.
-        This information was not stored on our side.
-      </p>
-    </div>
-    """.strip()
+    html_body = build_report_email_html(req)
 
     try:
         resend.Emails.send({
