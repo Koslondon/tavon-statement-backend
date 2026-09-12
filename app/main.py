@@ -116,12 +116,35 @@ def run_parser(processor: str, text: str) -> dict:
                 "computed_total": round(computed, 2), "stated_total": stated}
 
     if processor == "clover":
+        summary = clover.parse_summary(text)
+        interchange_items, interchange_stated = clover.parse_interchange_charges(lines)
         charge_items, charge_stated = clover.parse_service_charges(lines)
         fee_items, fee_stated = clover_fees.parse_fees(lines)
+        # True total cost = Interchange Charges + Service Charges + Fees,
+        # all three of which sit alongside each other on the statement's
+        # own summary box - none is "the" fee total on its own. Prefer
+        # each section's own stated total (closer to the source) over a
+        # re-summed figure, falling back to the summary box or a re-sum
+        # if a section's total line wasn't found for some reason.
+        interchange_total = interchange_stated if interchange_stated is not None else (
+            summary.get("interchange_stated", 0) or sum(i["fee"] for i in interchange_items))
+        service_total = charge_stated if charge_stated is not None else (
+            summary.get("service_charges_stated", 0) or sum(i["fee"] for i in charge_items))
+        fees_total = fee_stated if fee_stated is not None else (
+            summary.get("fees_stated", 0) or sum(i["fee"] for i in fee_items))
+        true_total = interchange_total + service_total + fees_total
+        turnover = summary.get("turnover")
+        true_blended_rate = (
+            round(abs(true_total) / turnover * 100, 4) if turnover else None
+        )
         return {
             "processor": "Clover / First Data",
+            "turnover": turnover,
+            "interchange_charges": interchange_items, "interchange_charges_stated": interchange_stated,
             "service_charges": charge_items, "service_charges_stated": charge_stated,
             "fees": fee_items, "fees_stated": fee_stated,
+            "true_total_fees": round(true_total, 2),
+            "true_blended_rate_pct": true_blended_rate,
         }
 
     if processor == "elavon":
