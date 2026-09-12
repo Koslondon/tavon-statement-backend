@@ -140,6 +140,26 @@ SUMMARY_LINE = re.compile(
 )
 
 
+CARD_TYPE_TOTAL_ROW = re.compile(
+    r"^Total\s+(?P<sales_items>\d+)\s+(?P<sales_amount>[\d,]+\.\d{2})\s+"
+    r"(?P<refund_items>\d+)\s+(?P<refund_amount>[\d,]+\.\d{2})\s+"
+    r"(?P<net_items>\d+)\s+(?P<net_amount>[\d,]+\.\d{2})\s*$"
+)
+
+
+def parse_transaction_count(lines):
+    """Pulls the Net "Total Items" figure from the OUTLET/CHAIN SUMMARY BY
+    CARD TYPE table's own Total row (e.g. 228 on the real Anne Urry
+    statement). This row's shape - three (items, amount) pairs in a row -
+    is distinctive enough to match without section-anchoring: no other
+    "Total" line on these statements has three leading integer counts."""
+    for raw in lines:
+        m = CARD_TYPE_TOTAL_ROW.match(raw.strip())
+        if m:
+            return int(m.group("net_items"))
+    return None
+
+
 def parse_summary(text):
     """Pulls the headline figures from the OUTLET/CHAIN SUMMARY box on page
     1 - "Total Amount Submitted" (turnover) plus the stated totals for
