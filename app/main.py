@@ -90,8 +90,24 @@ def run_parser(processor: str, text: str) -> dict:
     if processor == "aib":
         items, stated = aib.parse_msc_table(lines)
         computed = sum(i["total_charge"] for i in items)
+        # The MSC/card-fees table above is only PART of the real cost -
+        # the separate "Fees and Charges" table (Authorisation fee,
+        # Monthly Management Fee) sits alongside it and was previously
+        # excluded from computed_total entirely. Fold it in for the true
+        # total, same principle as Elavon/Trust Payments' hidden fee
+        # sections.
+        fee_items, fee_stated = aib.parse_fees_and_charges(lines)
+        fee_charges_total = sum(i["total_amount"] for i in fee_items)
+        true_total = computed + fee_charges_total
+        turnover = sum(i["turnover"] for i in items) or None
+        true_blended_rate = (
+            round(abs(true_total) / turnover * 100, 4) if turnover else None
+        )
         return {"processor": "AIB Merchant Services", "rows": items,
-                "computed_total": round(computed, 2), "stated_total": stated}
+                "computed_total": round(computed, 2), "stated_total": stated,
+                "fee_charges": fee_items, "fee_charges_stated": fee_stated,
+                "true_total_fees": round(true_total, 2),
+                "true_blended_rate_pct": true_blended_rate}
 
     if processor == "intercard":
         items, stated = intercard.parse_intercard_statement(lines)
