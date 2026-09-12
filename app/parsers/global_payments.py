@@ -184,6 +184,18 @@ def parse_summary(raw_text):
     if m:
         summary["sales_volume"] = _to_float(m.group(1))
 
+    # "TRANSACTION ITEM SUMMARY" prints SALES/REFUNDS/TOTAL side by side with
+    # DB ADJ/CR ADJ/TOTAL (pdftotext -layout merges each visual row into one
+    # line), e.g. "TOTAL:   879   64,503.55   TOTAL:   0   0.00" - the double
+    # "TOTAL:" on one line only ever occurs in this merged row, so it's a
+    # safe anchor. Per Kos: this combined SALES+REFUNDS item count (879) is
+    # the transaction count to report, not the Sales-only count (855) and
+    # not the row count of the Box 1 fee table (which is one row per fee
+    # category/scheme, not one row per transaction).
+    m = re.search(r"TOTAL:\s+([\d,]+)\s+[\d,]+\.\d{2}\s+TOTAL:", raw_text)
+    if m:
+        summary["transaction_count"] = int(m.group(1).replace(",", ""))
+
     return summary
 
 
@@ -292,6 +304,7 @@ def parse_full_statement(raw_text):
         "true_total_cost": true_total,
         "stated_charge_applied_to_account": summary.get("CHARGE APPLIED TO ACCOUNT"),
         "sales_volume": sales_volume,
+        "transaction_count": summary.get("transaction_count"),
         "true_blended_rate_pct": true_blended_rate,
         "box1_only_rate_pct": (
             round((box1_stated or 0) / sales_volume * 100, 4) if sales_volume else None
