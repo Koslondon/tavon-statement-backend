@@ -32,10 +32,21 @@ TRANS_TOTALING_ROW = re.compile(
 # that a description charset restricted to [A-Z0-9 /.&+-] would reject outright.
 FLAT_FEE_ROW = re.compile(r"^(?P<desc>.+?)\s+(?P<fee>-?[\d,]+\.\d{2})\s*$")
 TOTAL_ROW = re.compile(r"^Total\s+(-?[\d,]+\.\d{2})\s*$")
+# Chain statements prefix every row with a Merchant Number column before the
+# date; regular Outlet statements just have the date. Strip whichever is
+# present before matching, same fix as clover.py's service-charges parser.
+ROW_PREFIX = re.compile(r"^(?:\d{9,}\s+)?\d{2}/\d{2}/\d{2}\s+")
 
 
 def _f(s):
     return float(s.replace(",", ""))
+
+
+def _is_section_header(line, name):
+    # Some statements print a leading single-letter section marker (e.g.
+    # "F      FEES" instead of a bare "FEES") - tolerate it, same issue
+    # confirmed on a real Cavendish French statement for Service Charges.
+    return re.match(r"^[A-Z]?\s*" + re.escape(name) + r"$", line) is not None
 
 
 def parse_fees(lines):
@@ -53,12 +64,14 @@ def parse_fees(lines):
         if not line:
             continue
 
-        if line == "FEES":
+        if _is_section_header(line, "FEES"):
             in_section = True
             continue
 
         if not in_section:
             continue
+
+        line = ROW_PREFIX.sub("", line)
 
         tm = TOTAL_ROW.match(line)
         if tm:

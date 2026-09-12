@@ -20,6 +20,15 @@ import re
 PCT_ROW = re.compile(
     r"^(?P<desc>.+?)\s+(?P<rate>\.\d+)\s+(?:\w+\s+)?DISC RATE TIMES\s+(?P<volume>[\d,]+\.\d{2})\s+(?P<fee>-?[\d,]+\.\d{2})\s*$"
 )
+# Chain-format statements (multiple outlets under one merchant) omit the
+# volume figure from this table entirely - confirmed on a real Alternative
+# Salon Ltd statement, where every row is "[desc] .0NNNNN DISC RATE[ TIMES]?
+# [fee]" with no volume number at all between the rate and the fee. Only
+# tried after PCT_ROW fails, since PCT_ROW is the more specific/informative
+# match when a volume is actually present.
+PCT_ROW_NO_VOLUME = re.compile(
+    r"^(?P<desc>.+?)\s+(?P<rate>\.\d+)\s+DISC RATE(?:\s+TIMES)?\s+(?P<fee>-?[\d,]+\.\d{2})\s*$"
+)
 # Confirmed on the real statement: occasionally the row wraps mid-sentence,
 # e.g. "MASTERCARD CHIP SERVICE CHARGE .015696 DISC RATE TIMES" on one line
 # and "30/04/22  249.60  -3.92" (volume + fee, with its own date prefix) on
@@ -28,19 +37,39 @@ PCT_ROW_WRAP_PREFIX = re.compile(
     r"^(?P<desc>.+?)\s+(?P<rate>\.\d+)\s+(?:\w+\s+)?DISC RATE TIMES\s*$"
 )
 DATE_PREFIX = re.compile(r"^\d{2}/\d{2}/\d{2}\s+")
+# Chain statements prefix every row with a Merchant Number column before the
+# date (e.g. "520334508559614    30/06/24     MC DEBIT CHIP..."); regular
+# Outlet statements just have the date. Strip whichever is present so the
+# description capture group never swallows it - previously this caused every
+# single row to categorise as "unmapped" even though the fee totals were
+# already correct, since the category lookup table has no entries with a
+# leading date/merchant-number baked in.
+ROW_PREFIX = re.compile(r"^(?:\d{9,}\s+)?\d{2}/\d{2}/\d{2}\s+")
 PER_TXN_ROW = re.compile(
     r"^(?P<desc>.+?)\s+(?P<count>\d+)\s+TRANSACTIONS? AT\s+(?P<rate>\.\d+)\s+(?P<fee>-?[\d,]+\.\d{2})\s*$"
 )
 TOTAL_ROW = re.compile(r"^Total\s+(-?[\d,]+\.\d{2})\s*$")
+# Interchange Charges rows are simpler than Service Charges - just a date,
+# description, and amount, no rate or volume printed at all.
+FLAT_ROW = re.compile(r"^(?P<desc>.+?)\s+(?P<fee>-?[\d,]+\.\d{2})\s*$")
+# Section headers sometimes carry a leading single-letter marker from the
+# statement's own lettered index (e.g. "E      SERVICE CHARGES" instead of
+# a bare "SERVICE CHARGES") - confirmed on a real Cavendish French
+# statement. An exact-match check against the bare header silently matched
+# nothing, so the whole section was skipped even though its rows and total
+# were sitting right there in the text.
+def _is_section_header(line, name):
+    return re.match(r"^[A-Z]?\s*" + re.escape(name) + r"$", line) is not None
+
 
 CARD_TYPE_CATEGORY = {
-    "MC DEBIT CHIP": "debit", "MC DEBIT NQ": "debit", "MC DEBIT CHIP NQ": "debit",
-    "MC DBT CHP NQ": "debit",
+    "MC DEBIT": "debit", "MC DEBIT CHIP": "debit", "MC DEBIT NQ": "debit", "MC DEBIT CHIP NQ": "debit",
+    "MC DBT CHP NQ": "debit", "MC DBT CHP": "debit",
     "VISA": "credit", "VISA CHIP": "credit", "VISA NON-QUAL": "credit",
     "MASTERCARD": "credit", "MASTERCARD CHIP": "credit", "MASTERCARD NQ": "credit",
     "MASTERCARD CHIP NQ": "credit",
     "VISA DEBIT": "debit", "VISA DEBIT CHIP": "debit", "VISA NQ DEBIT": "debit",
-    "VISA DEBIT NQ": "debit",
+    "VISA DEBIT NQ": "debit", "VISA DR CHIP": "debit", "VISA DR": "debit",
     "VISA BUS DR CARD": "business_debit", "VISA BUS DR CARD NQ": "business_debit",
     "VISA PRCH": "business_credit",  # (EX BUS DR) -> purchasing, not the debit-card variant
     "MC PURCHASE CARD": "business_credit", "MC PURCHASE CARD NQ": "business_credit",
@@ -49,21 +78,130 @@ CARD_TYPE_CATEGORY = {
 }
 
 
+def _keyword_categorize(key):
+    """Fallback for description phrasing not in CARD_TYPE_CATEGORY - keyword
+    rules per Kos, so a new abbreviation variant on a future statement gets
+    a reasonable bucket instead of silently falling into "unmapped". Tokens
+    are checked as whole words (via regex \\b) so e.g. "CORP" in "CORPORATE"
+    doesn't accidentally match a shorter unrelated token.
+    NOTE: any "(EX BUS DR)" qualifier must already be stripped from `key`
+    before calling this - it means "excluding business debit", a negation,
+    not a positive business+debit signal, and would otherwise be
+    misclassified as business_debit by this same keyword logic.
+    """
+    def has(*words):
+        return any(re.search(r"\b" + w + r"\b", key) for w in words)
+
+    is_business = has("BUS", "BUSINESS", "PRCH", "PURCHASE", "CORP", "CORPORATE", "COMCD")
+    is_debit = has("DR", "DEBIT", "DBT", "DB")
+    is_visa = has("VISA", "VI")
+    is_mc = has("MC", "MASTERCARD", "M/C")
+
+    if is_business:
+        return "business_debit" if is_debit else "business_credit"
+    if is_debit:
+        return "debit"
+    if is_visa or is_mc:
+        return "credit"
+    return "unmapped"
+
+
 def _f(s):
     return float(s.replace(",", ""))
 
 
+
 def _categorize(desc):
+    # "(EX BUS DR)" means "excluding business debit cards" - a negation
+    # qualifier on a business/purchasing-card row, not a positive signal
+    # that this row IS a business debit card. Strip it before any keyword
+    # matching, or the fallback heuristic below would wrongly read "BUS"
+    # and "DR" together as business_debit.
+    key = desc.replace("(EX BUS DR)", "").strip()
     # Strip known trailing labels to find the card-type key
-    key = desc
-    for suffix in [" NQ SRV CHG", " NQ SERVICE CHARGE", " NQ SERVICE CHRG",
-                   " SERVICE CHARGE", " SERV CHRG", " SRV CHG",
-                   " NQ SALES TRANS FEE", " NQ SALE T/FEE", " SALES TRANS FEE",
-                   " SALE T/FEE", " SALE TRANS FEE", "(EX BUS DR)"]:
+    for suffix in [" NQ SRV CHG", " NQ SRV CHRG", " NQ SERVICE CHARGE", " NQ SERVICE CHRG",
+                   " SERVICE CHARGE", " SERV CHRG", " SRV CHG", " SRV CHRG",
+                   " NQ SALES TRANS FEE", " NQ SALE T/FEE", " NQ SALES T/FEE",
+                   " NQ SALES TRANS", " NQ SALE TRANS",
+                   " SALES TRANS FEE", " SALE T/FEE", " SALES T/FEE",
+                   " SLS T/FEE", " SALE TRANS FEE"]:
         if key.endswith(suffix):
             key = key[: -len(suffix)].strip()
             break
-    return CARD_TYPE_CATEGORY.get(key, "unmapped")
+    if key in CARD_TYPE_CATEGORY:
+        return CARD_TYPE_CATEGORY[key]
+    return _keyword_categorize(key)
+
+
+SUMMARY_LINE = re.compile(
+    r"Page\s+\d+\s+(?:[A-Z]\s+)?"
+    r"(Total Amount Submitted|Interchange Charges|Service Charges|Fees|Chargebacks/Reversals)"
+    r"\s+(-?[\d,]+\.\d{2})"
+)
+
+
+def parse_summary(text):
+    """Pulls the headline figures from the OUTLET/CHAIN SUMMARY box on page
+    1 - "Total Amount Submitted" (turnover) plus the stated totals for
+    Interchange Charges, Service Charges, Fees, and Chargebacks/Reversals.
+    Confirmed against 4 real statements spanning both Outlet and Chain
+    statement layouts, with and without a lettered section-index marker.
+    Takes the full statement text (not per-line), since this box's layout
+    varies enough between statements that matching across the whole text
+    is more robust than trying to anchor to one exact line shape."""
+    result = {}
+    label_to_key = {
+        "Total Amount Submitted": "turnover",
+        "Interchange Charges": "interchange_stated",
+        "Service Charges": "service_charges_stated",
+        "Fees": "fees_stated",
+        "Chargebacks/Reversals": "chargebacks_stated",
+    }
+    for label, amount in SUMMARY_LINE.findall(text):
+        result[label_to_key[label]] = _f(amount)
+    return result
+
+
+def parse_interchange_charges(lines):
+    """Interchange Charges is its own section, present on some statements
+    (confirmed on real Cavendish French and Goldcrest Oil statements) and
+    absent/all-zero on others. Rows here are simpler than Service Charges -
+    just a date, description, and amount, no rate or volume printed at all.
+    Categorised into the same card-type buckets so interchange folds into
+    the same true-cost-per-card-type view as the service charges."""
+    items = []
+    stated_total = None
+    in_section = False
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+
+        if _is_section_header(line, "INTERCHANGE CHARGES"):
+            in_section = True
+            continue
+
+        if not in_section:
+            continue
+
+        line = ROW_PREFIX.sub("", line)
+
+        tm = TOTAL_ROW.match(line)
+        if tm:
+            stated_total = _f(tm.group(1))
+            break
+
+        m = FLAT_ROW.match(line)
+        if m:
+            desc = m.group("desc").strip()
+            items.append({
+                "description": desc,
+                "fee": _f(m.group("fee")),
+                "category": _categorize(desc),
+            })
+            continue
+
+    return items, stated_total
 
 
 def parse_service_charges(lines):
@@ -91,12 +229,14 @@ def parse_service_charges(lines):
         if not line:
             continue
 
-        if line == "SERVICE CHARGES":
+        if _is_section_header(line, "SERVICE CHARGES"):
             in_section = True
             continue
 
         if not in_section:
             continue
+
+        line = ROW_PREFIX.sub("", line)
 
         if pending_wrap is not None:
             rest = DATE_PREFIX.sub("", line)
@@ -169,6 +309,23 @@ def parse_service_charges(lines):
                 "count": int(m.group("count")),
                 "per_txn_rate": float(m.group("rate")),
                 "fee": _f(m.group("fee")),
+                "category": _categorize(m.group("desc").strip()),
+                "scale_flag": None,
+            })
+            continue
+
+        # Chain-format fallback: same percentage row, but with no volume
+        # figure printed at all - capture rate + fee only, volume unknown.
+        m = PCT_ROW_NO_VOLUME.match(line)
+        if m:
+            rate = float(m.group("rate"))
+            fee = _f(m.group("fee"))
+            items.append({
+                "description": m.group("desc").strip(),
+                "row_type": "percentage_no_volume",
+                "rate": rate,
+                "volume": None,
+                "fee": fee,
                 "category": _categorize(m.group("desc").strip()),
                 "scale_flag": None,
             })
