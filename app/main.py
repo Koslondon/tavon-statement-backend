@@ -98,8 +98,29 @@ def run_parser(processor: str, text: str) -> dict:
     if processor == "elavon":
         items, stated = elavon.parse_card_fees(lines)
         computed = sum(i["fee"] for i in items)
-        return {"processor": "Elavon", "rows": items,
-                "computed_total": round(computed, 2), "stated_total": stated}
+        # Card Fees alone (parsed above) is only the discount-rate portion
+        # of the real cost - Activity Fees (per-transaction authorisation
+        # charge) and the PCI/Other Fees line sit alongside it and are not
+        # reflected in the Card Fees total. parse_summary() reads the
+        # statement's own Fees Summary box, which already adds these
+        # together into "Total Fees" - that combined figure (not the Card
+        # Fees table total) is what should drive the blended rate.
+        summary = elavon.parse_summary(lines)
+        turnover = summary.get("turnover")
+        true_total_fees = summary.get("total_fees", round(computed, 2))
+        true_blended_rate = (
+            round(true_total_fees / turnover * 100, 4) if turnover else None
+        )
+        return {
+            "processor": "Elavon", "rows": items,
+            "computed_total": round(computed, 2), "stated_total": stated,
+            "turnover": turnover,
+            "transaction_count": summary.get("transaction_count"),
+            "activity_fees": summary.get("activity_fees"),
+            "other_fees": summary.get("other_fees"),
+            "true_total_fees": true_total_fees,
+            "true_blended_rate_pct": true_blended_rate,
+        }
 
     if processor == "global_payments":
         result = global_payments.parse_full_statement(text)
