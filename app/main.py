@@ -117,6 +117,7 @@ def run_parser(processor: str, text: str) -> dict:
 
     if processor == "clover":
         summary = clover.parse_summary(text)
+        transaction_count = clover.parse_transaction_count(lines)
         interchange_items, interchange_stated = clover.parse_interchange_charges(lines)
         charge_items, charge_stated = clover.parse_service_charges(lines)
         fee_items, fee_stated = clover_fees.parse_fees(lines)
@@ -137,9 +138,25 @@ def run_parser(processor: str, text: str) -> dict:
         true_blended_rate = (
             round(abs(true_total) / turnover * 100, 4) if turnover else None
         )
+        # Per Kos: these statements don't break out a domestic/international
+        # split directly, but a "... INT ACCEPTANCE FEE" line in the Fees
+        # section (Visa and/or Mastercard) carries the volume of card
+        # transactions the scheme itself flagged as international - use
+        # that as a proxy. Confirmed present with a real volume figure on
+        # the Anne Urry statement (£3,475.80 of £25,194.90 turnover); absent
+        # entirely on two other real statements checked, and present but
+        # missing its volume figure on a real Chain-format statement (same
+        # gap as the Service Charges table). Sums to 0 when unavailable,
+        # which correctly falls back to "no international detected".
+        international_volume = sum(
+            f.get("volume") or 0 for f in fee_items
+            if "INT" in f["description"].upper() and "ACCEPTANCE FEE" in f["description"].upper()
+        )
         return {
             "processor": "Clover / First Data",
             "turnover": turnover,
+            "transaction_count": transaction_count,
+            "international_volume": round(international_volume, 2),
             "interchange_charges": interchange_items, "interchange_charges_stated": interchange_stated,
             "service_charges": charge_items, "service_charges_stated": charge_stated,
             "fees": fee_items, "fees_stated": fee_stated,
