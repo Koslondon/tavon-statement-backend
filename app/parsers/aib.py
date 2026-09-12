@@ -55,6 +55,30 @@ TOTAL_MSC_ROW = re.compile(
     r"(?P<scheme>-?[\d,]+\.\d{2})\s+(?P<total>-?[\d,]+\.\d{2})\s+GBP\s*$"
 )
 
+# "Fees and Charges" table (separate from the MSC/card-fees table above) -
+# this is where the Authorisation fee (a small per-transaction charge, e.g.
+# GBP 0.01-0.03) and the Monthly Management Fee (a flat fee, e.g. GBP 9.50)
+# live. Confirmed via a live pdftotext -layout run against two real
+# statements (Adamson Doors and Moss Grove Dental Practice, both Nov 2023):
+# each fee prints as one numeric line (description, count, fee amount,
+# fee total, [VAT % and VAT amount columns are blank on every real example
+# seen], total amount, currency) immediately followed by ONE wrap line
+# holding the fee's date-range period, e.g. "31.10.2023 - 29.11.2023".
+# These were previously not parsed at all, so they never reached
+# "computed_total" or the frontend's "Other fees" figure.
+FEE_CHARGE_ROW = re.compile(
+    r"^(?P<desc>[A-Za-z][A-Za-z ]+?)\s+"
+    r"(?P<count>\d+)\s+"
+    r"(?P<fee_amount>[\d,]+\.\d{2})\s+"
+    r"(?P<fee_total>-?[\d,]+\.\d{2})\s+"
+    r"(?P<total_amount>-?[\d,]+\.\d{2})\s+"
+    r"GBP\s*$"
+)
+TOTAL_FEES_ROW = re.compile(
+    r"^TOTAL FEES CHARGED\s+(?P<count>\d+)\s+(?P<fee_total>-?[\d,]+\.\d{2})\s+"
+    r"(?P<vat_amount>-?[\d,]+\.\d{2})\s+(?P<total_amount>-?[\d,]+\.\d{2})\s+GBP\s*$"
+)
+
 MAX_WRAP_LINES = 6  # real wrap is always 4 lines; a small safety margin
 
 
@@ -129,6 +153,66 @@ def parse_msc_table(lines):
             continue
 
         m = NUMERIC_ROW.match(line) if line else None
+        if m:
+            close_pending()
+            pending_numeric = m
+            pending_wrap = []
+            continue
+
+        if pending_numeric is not None:
+            if not line or len(pending_wrap) >= MAX_WRAP_LINES:
+                close_pending()
+                pending_numeric = None
+                pending_wrap = []
+            else:
+                pending_wrap.append(line)
+        # else: unrelated page furniture between records - ignore.
+
+    close_pending()
+    return items, stated_total
+
+
+def parse_fees_and_charges(lines):
+    """Parses the separate "Fees and Charges" table - Authorisation fee
+    and Monthly Management Fee. Same wrap pattern as parse_msc_table but
+    shorter (each fee's numeric line is followed by exactly one wrap line
+    holding its date-range period), confirmed against two real statements.
+    """
+    items = []
+    stated_total = None
+    pending_numeric = None
+    pending_wrap = []
+
+    def close_pending():
+        if pending_numeric is None:
+            return
+        m = pending_numeric
+        items.append({
+            "description": m.group("desc").strip(),
+            "period": " ".join(pending_wrap).strip() or None,
+            "count": int(m.group("count")),
+            "fee_amount": _f(m.group("fee_amount")),
+            "fee_total": _f(m.group("fee_total")),
+            "total_amount": _f(m.group("total_amount")),
+        })
+
+    for raw in lines:
+        line = raw.strip()
+
+        tm = TOTAL_FEES_ROW.match(line) if line else None
+        if tm:
+            close_pending()
+            pending_numeric = None
+            pending_wrap = []
+            stated_total = {
+                "count": int(tm.group("count")),
+                "fee_total": _f(tm.group("fee_total")),
+                "vat_amount": _f(tm.group("vat_amount")),
+                "total_amount": _f(tm.group("total_amount")),
+            }
+            continue
+
+        m = FEE_CHARGE_ROW.match(line) if line else None
         if m:
             close_pending()
             pending_numeric = m
