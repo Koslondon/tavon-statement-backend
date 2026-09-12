@@ -37,6 +37,23 @@ OTHER_FEES_MAP = {
     "SECURED PCI": ("pci", "CONFIRMED"),
 }
 
+SUMMARY_SALES_ROW = re.compile(
+    r"^Sales\s+(?P<items>[\d,]+)\s+(?P<amount>[\d,]+\.\d{2})\s+"
+    r"Card Fees\s+(?P<card_fees>[\d,]+\.\d{2})\s*$"
+)
+SUMMARY_FEE_LABELS = {
+    "Activity Fees": "activity_fees",
+    "Other Fees (Taxable and Non Taxable)": "other_fees",
+    "Total Fees": "total_fees",
+    "VAT Amount": "vat_amount",
+    "Rebate": "rebate",
+    "Total": "total_payable",
+}
+SUMMARY_FEE_LINE = re.compile(
+    r"^(?P<label>" + "|".join(re.escape(l) for l in SUMMARY_FEE_LABELS)
+    + r")\s+(?P<value>[\u00ad-]?[\d,]+\.\d{2})\s*$"
+)
+
 CARD_FEES_ROW = re.compile(
     r"^(?P<desc>.+?)\s+"
     r"(?P<volume>[\d,]+\.\d{2})\s+"
@@ -104,6 +121,57 @@ def parse_card_fees(lines):
             "is_cnp": is_cnp,
         })
     return items, stated_total
+
+
+def parse_summary(lines):
+    """The 'Summary' box (page 2) prints Transaction Summary (turnover,
+    item count) and Fees Summary (Card Fees, Activity Fees, Other Fees,
+    Total Fees, VAT, Rebate, Total Payable) side by side - pdftotext
+    -layout merges each visual row into one text line, e.g.:
+        Sales    4,972    51,314.08    Card Fees    360.15
+                                        Activity Fees    101.00
+                                        ...
+                                        Total Fees    463.65
+
+    This is the statement's own authoritative total. The Card Fees table
+    parsed by parse_card_fees() above is only the discount-rate portion
+    of the cost - Activity Fees (the £0.02-per-transaction authorisation
+    charge seen on every card scheme) and the PCI/Other Fees charge sit
+    ALONGSIDE it and are not reflected in the Card Fees total at all.
+    Confirmed on the Pattisons Jul 2026 statement: Card Fees 360.15 +
+    Activity Fees 101.00 + Other Fees 2.50 = Total Fees 463.65 exactly -
+    a true blended rate of ~0.90%, not the ~0.70% Card Fees alone implies.
+
+    Negative values (Rebate) print with a soft hyphen (U+00AD) rather than
+    a plain ASCII minus in this statement's text layer - normalised below."""
+    result = {}
+    in_summary = False
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+
+        if line == "Summary":
+            in_summary = True
+            continue
+        if not in_summary:
+            continue
+
+        m = SUMMARY_SALES_ROW.match(line)
+        if m:
+            result["turnover"] = _f(m.group("amount"))
+            result["transaction_count"] = int(m.group("items").replace(",", ""))
+            result["card_fees"] = _f(m.group("card_fees"))
+            continue
+
+        m = SUMMARY_FEE_LINE.match(line)
+        if m:
+            key = SUMMARY_FEE_LABELS[m.group("label")]
+            value = m.group("value").replace("\u00ad", "-")
+            result[key] = _f(value)
+            if key == "total_payable":
+                break  # last line of the Fees Summary box
+    return result
 
 
 if __name__ == "__main__":
