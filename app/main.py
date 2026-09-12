@@ -35,6 +35,9 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5MB hard cap
 # every call to /email-report will fail with a clear 502, not silently.
 resend.api_key = os.environ.get("RESEND_API_KEY", "")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "Tavon Partners <statements@tavonpartners.com>")
+# Where "Quote me better price" lead notifications land - defaults to
+# Tavon's own inbox, overridable via env var without a code change.
+LEAD_NOTIFY_EMAIL = os.environ.get("LEAD_NOTIFY_EMAIL", "tavonpartners@gmail.com")
 
 app = FastAPI(title="Tavon Partners Statement Checker")
 
@@ -205,19 +208,32 @@ class EmailFeeRow(BaseModel):
     rate_pct: float | None = None
 
 
-class EmailReportRequest(BaseModel):
-    email: EmailStr
+class StatementFigures(BaseModel):
+    """Fields shared by both the client-facing report email and the
+    internal lead-notification email - the two templates differ only in
+    header/recipient framing, not in how the statement figures render."""
     provider: str = "Merchant"
     # Not yet populated by any parser - no processor currently extracts a
-    # statement date/period from the PDF. Field exists so the email
-    # template is ready for it; falls back to generic wording until that
-    # parsing work is done per-processor.
+    # statement date/period from the PDF. Field exists so both templates
+    # are ready for it; falls back to generic wording until that parsing
+    # work is done per-processor.
     statement_period: str | None = None
     turnover: float | None = None
     total_fees: float | None = None
     blended_rate: float | None = None
     transaction_count: int | None = None
     fee_rows: list[EmailFeeRow] = Field(default_factory=list, max_length=200)
+
+
+class EmailReportRequest(StatementFigures):
+    email: EmailStr
+
+
+class LeadNotifyRequest(StatementFigures):
+    name: str
+    business: str = ""
+    email: EmailStr
+    phone: str = ""
 
 
 def _gbp(n: float | None) -> str:
@@ -234,14 +250,9 @@ def _pct(n: float | None) -> str:
     return "{:.2f}%".format(abs(n))
 
 
-
-
-def build_report_email_html(req: "EmailReportRequest") -> str:
-    period_line = (
-        f"Statement breakdown for {req.statement_period}"
-        if req.statement_period else "Your statement breakdown"
-    )
-
+def _figures_section_html(f: "StatementFigures", intro_line: str) -> str:
+    """The part shared by both templates: intro line, the two highlighted
+    stat cards, the fee breakdown table, and the blended-rate block."""
     fee_rows_html = "".join(
         f"""<tr>
               <td style="padding:10px 8px;border-bottom:1px solid #EEE;color:#222;font-size:13.5px">{r.label}</td>
@@ -249,43 +260,23 @@ def build_report_email_html(req: "EmailReportRequest") -> str:
               <td style="padding:10px 8px;border-bottom:1px solid #EEE;color:#222;font-size:13.5px;text-align:right;font-weight:600">{_gbp(r.fee)}</td>
               <td style="padding:10px 8px;border-bottom:1px solid #EEE;color:#1E6FD9;font-size:13.5px;text-align:right;font-weight:600">{_pct(r.rate_pct) if r.rate_pct is not None else '—'}</td>
             </tr>"""
-        for r in req.fee_rows
+        for r in f.fee_rows
     ) or """<tr><td colspan="4" style="padding:14px 8px;color:#888;font-size:13.5px">No fee breakdown available for this statement.</td></tr>"""
 
     return f"""
-<div style="background:#F4F6F9;padding:28px 12px;font-family:Arial,Helvetica,sans-serif">
-  <table role="presentation" style="max-width:600px;width:100%;margin:0 auto;background:#FFFFFF;border-radius:14px;overflow:hidden;border:1px solid #E4E8EE">
-
-    <!-- Header: processor name + Tavon Partners branding -->
-    <tr>
-      <td style="padding:26px 28px 20px;border-bottom:1px solid #EEE">
-        <table role="presentation" style="width:100%">
-          <tr>
-            <td style="vertical-align:middle">
-              <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#8B96A5;margin-bottom:4px">Statement checker</div>
-              <div style="font-size:19px;font-weight:700;color:#111">{req.provider} Statement</div>
-            </td>
-            <td style="vertical-align:middle;text-align:right;white-space:nowrap">
-              <span style="font-size:14px;font-weight:700;color:#111;letter-spacing:.04em;vertical-align:middle">TAVON PARTNERS</span>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-
     <!-- Intro + highlighted top-line figures -->
     <tr>
       <td style="padding:22px 28px 6px">
-        <div style="font-size:15px;font-weight:600;color:#222;margin-bottom:16px">{period_line}</div>
+        <div style="font-size:15px;font-weight:600;color:#222;margin-bottom:16px">{intro_line}</div>
         <table role="presentation" style="width:100%;border-spacing:0">
           <tr>
             <td style="width:50%;padding:16px;background:#F4F8FF;border-radius:10px;text-align:center">
-              <div style="font-size:20px;font-weight:700;color:#111;font-family:'Courier New',monospace">{_gbp(req.turnover)}</div>
+              <div style="font-size:20px;font-weight:700;color:#111;font-family:'Courier New',monospace">{_gbp(f.turnover)}</div>
               <div style="font-size:11.5px;color:#6E7A8C;margin-top:4px">Total revenue this statement</div>
             </td>
             <td style="width:12px"></td>
             <td style="width:50%;padding:16px;background:#F4F8FF;border-radius:10px;text-align:center">
-              <div style="font-size:20px;font-weight:700;color:#111;font-family:'Courier New',monospace">{_gbp(req.total_fees)}</div>
+              <div style="font-size:20px;font-weight:700;color:#111;font-family:'Courier New',monospace">{_gbp(f.total_fees)}</div>
               <div style="font-size:11.5px;color:#6E7A8C;margin-top:4px">Total fees charged</div>
             </td>
           </tr>
@@ -315,14 +306,47 @@ def build_report_email_html(req: "EmailReportRequest") -> str:
         <table role="presentation" style="width:100%;background:#0E1E33;border-radius:12px">
           <tr>
             <td style="padding:20px;text-align:center">
-              <div style="font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:#9CC3F0;margin-bottom:6px">Your blended rate</div>
-              <div style="font-size:30px;font-weight:700;color:#7CC0FF;font-family:'Courier New',monospace">{_pct(req.blended_rate)}</div>
-              <div style="font-size:12px;color:#B9C5D6;margin-top:6px">{('Based on ' + str(req.transaction_count) + ' transactions processed') if req.transaction_count else ''}</div>
+              <div style="font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:#9CC3F0;margin-bottom:6px">Blended rate</div>
+              <div style="font-size:30px;font-weight:700;color:#7CC0FF;font-family:'Courier New',monospace">{_pct(f.blended_rate)}</div>
+              <div style="font-size:12px;color:#B9C5D6;margin-top:6px">{('Based on ' + str(f.transaction_count) + ' transactions processed') if f.transaction_count else ''}</div>
             </td>
           </tr>
         </table>
       </td>
     </tr>
+    """
+
+
+def build_report_email_html(req: "EmailReportRequest") -> str:
+    """Client-facing template - sent when a merchant clicks 'Send results
+    to my email'."""
+    intro_line = (
+        f"Statement breakdown for {req.statement_period}"
+        if req.statement_period else "Your statement breakdown"
+    )
+
+    return f"""
+<div style="background:#F4F6F9;padding:28px 12px;font-family:Arial,Helvetica,sans-serif">
+  <table role="presentation" style="max-width:600px;width:100%;margin:0 auto;background:#FFFFFF;border-radius:14px;overflow:hidden;border:1px solid #E4E8EE">
+
+    <!-- Header: processor name + Tavon Partners branding -->
+    <tr>
+      <td style="padding:26px 28px 20px;border-bottom:1px solid #EEE">
+        <table role="presentation" style="width:100%">
+          <tr>
+            <td style="vertical-align:middle">
+              <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#8B96A5;margin-bottom:4px">Statement checker</div>
+              <div style="font-size:19px;font-weight:700;color:#111">{req.provider} Statement</div>
+            </td>
+            <td style="vertical-align:middle;text-align:right;white-space:nowrap">
+              <span style="font-size:14px;font-weight:700;color:#111;letter-spacing:.04em;vertical-align:middle">TAVON PARTNERS</span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+    {_figures_section_html(req, intro_line)}
 
     <!-- Footer -->
     <tr>
@@ -330,6 +354,65 @@ def build_report_email_html(req: "EmailReportRequest") -> str:
         <p style="margin:0;font-size:11.5px;line-height:1.6;color:#9AA6B8">
           Sent at your request from the Tavon Partners Merchant Statement Checker. This information was not stored on our side.
           Questions? WhatsApp us on <a href="https://wa.me/447584503279" style="color:#1E6FD9">07584 503279</a>.
+        </p>
+      </td>
+    </tr>
+
+  </table>
+</div>
+""".strip()
+
+
+def build_lead_email_html(req: "LeadNotifyRequest") -> str:
+    """Internal template - sent to Tavon when a merchant clicks 'Quote me
+    better price'. Same figures layout as the client email, with a client
+    details block up top instead of the client-facing framing/footer."""
+    intro_line = (
+        f"Statement breakdown for {req.statement_period}"
+        if req.statement_period else "Statement breakdown"
+    )
+
+    return f"""
+<div style="background:#F4F6F9;padding:28px 12px;font-family:Arial,Helvetica,sans-serif">
+  <table role="presentation" style="max-width:600px;width:100%;margin:0 auto;background:#FFFFFF;border-radius:14px;overflow:hidden;border:1px solid #E4E8EE">
+
+    <!-- Header: "New Quote Request" + Tavon Partners branding -->
+    <tr>
+      <td style="padding:26px 28px 20px;border-bottom:1px solid #EEE">
+        <table role="presentation" style="width:100%">
+          <tr>
+            <td style="vertical-align:middle">
+              <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#8B96A5;margin-bottom:4px">Statement checker lead</div>
+              <div style="font-size:19px;font-weight:700;color:#111">New Quote Request</div>
+            </td>
+            <td style="vertical-align:middle;text-align:right;white-space:nowrap">
+              <span style="font-size:14px;font-weight:700;color:#111;letter-spacing:.04em;vertical-align:middle">TAVON PARTNERS</span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+    <!-- Client details -->
+    <tr>
+      <td style="padding:22px 28px 4px">
+        <div style="font-size:13px;font-weight:700;letter-spacing:.03em;color:#111;text-transform:uppercase;margin-bottom:8px">Client details</div>
+        <table role="presentation" style="width:100%;border-collapse:collapse">
+          <tr><td style="padding:5px 8px 5px 0;color:#8B96A5;font-size:13px;width:100px">Name</td><td style="padding:5px 8px;color:#111;font-size:13.5px;font-weight:600">{req.name}</td></tr>
+          <tr><td style="padding:5px 8px 5px 0;color:#8B96A5;font-size:13px">Business</td><td style="padding:5px 8px;color:#111;font-size:13.5px">{req.business or '—'}</td></tr>
+          <tr><td style="padding:5px 8px 5px 0;color:#8B96A5;font-size:13px">Email</td><td style="padding:5px 8px;color:#111;font-size:13.5px"><a href="mailto:{req.email}" style="color:#1E6FD9">{req.email}</a></td></tr>
+          <tr><td style="padding:5px 8px 5px 0;color:#8B96A5;font-size:13px">Phone</td><td style="padding:5px 8px;color:#111;font-size:13.5px">{req.phone or '—'}</td></tr>
+        </table>
+      </td>
+    </tr>
+
+    {_figures_section_html(req, intro_line)}
+
+    <!-- Footer -->
+    <tr>
+      <td style="padding:0 28px 26px">
+        <p style="margin:0;font-size:11.5px;line-height:1.6;color:#9AA6B8">
+          Generated via the Merchant Statement Checker on tavonpartners.com. Reply directly to this email to reach the client.
         </p>
       </td>
     </tr>
@@ -359,5 +442,30 @@ async def email_report(req: EmailReportRequest):
     except Exception as exc:  # noqa: BLE001 - never log the email body/address on failure
         log.warning("email-report send failed: %s", type(exc).__name__)
         raise HTTPException(502, "Could not send that email right now - please try again shortly.")
+
+    return {"sent": True}
+
+
+@app.post("/notify-lead")
+async def notify_lead(req: LeadNotifyRequest):
+    if not resend.api_key:
+        log.error("notify-lead called but RESEND_API_KEY is not configured.")
+        raise HTTPException(500, "Lead notification is not configured yet.")
+
+    html_body = build_lead_email_html(req)
+
+    try:
+        resend.Emails.send({
+            "from": EMAIL_FROM,
+            "to": [LEAD_NOTIFY_EMAIL],
+            # Set so a reply from Tavon's inbox goes straight to the client,
+            # not back to the noreply-style sending address.
+            "reply_to": [req.email],
+            "subject": f"New quote request — {req.name} ({req.provider})",
+            "html": html_body,
+        })
+    except Exception as exc:  # noqa: BLE001
+        log.warning("notify-lead send failed: %s", type(exc).__name__)
+        raise HTTPException(502, "Could not send that notification right now.")
 
     return {"sent": True}
