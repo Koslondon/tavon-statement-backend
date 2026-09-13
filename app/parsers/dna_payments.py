@@ -119,12 +119,27 @@ def parse_a2_by_type(lines):
     Total / Volume. Row descriptions sometimes wrap: the numeric line carries
     the FIRST part of the description (e.g. "MasterCard Domestic"), and a
     following text-only line carries the rest (e.g. "Corporate Credit"),
-    which belongs to the row ALREADY emitted, not the next one."""
+    which belongs to the row ALREADY emitted, not the next one.
+
+    Section-anchored: A2's row shape (desc, volume, count, acquiring,
+    refunds, total) is structurally identical to A1's daily rows - without
+    anchoring to the "A2 Transactional fees per payment type" header, this
+    also swallows every A1 row too, silently doubling the computed total
+    (confirmed: produced -450.48 against a real -225.24 statement total
+    before this fix)."""
     items = []
     stated_total = None
+    in_section = False
     for raw in lines:
         line = raw.rstrip("\n")
         if not line.strip():
+            continue
+
+        if re.match(r"^\s*A2\s+Transactional fees per payment type", line):
+            in_section = True
+            continue
+
+        if not in_section:
             continue
 
         if line.strip().startswith("Totals"):
@@ -135,7 +150,7 @@ def parse_a2_by_type(lines):
                     "count": int(tm.group("count")),
                     "total": _f(tm.group("total")),
                 }
-            continue
+            break  # this section's own closing total - stop here
 
         m = A2_LINE.match(line)
         if m:
@@ -150,6 +165,7 @@ def parse_a2_by_type(lines):
                 "acquiring_flat_fee": _f(m.group("acquiring")),
                 "total": total,
                 "true_effective_rate_pct": round(true_rate, 4) if true_rate is not None else None,
+                "category": _categorize(desc),
             })
         else:
             # Only append if this text-only line is genuinely a wrapped
@@ -158,8 +174,58 @@ def parse_a2_by_type(lines):
             # discarded rather than glued onto the last row's description.
             if items and _is_genuine_description_continuation(line):
                 items[-1]["description"] = (items[-1]["description"] + " " + line.strip()).strip()
+                items[-1]["category"] = _categorize(items[-1]["description"])
 
     return items, stated_total
+
+
+def _categorize(desc):
+    """Card-type bucket for the checker's fee-breakdown table and "how your
+    customers pay" mix - matches the taxonomy used across every other
+    processor. DNA Payments' own wording (Domestic/International/Intra,
+    Personal/Corporate, Credit/Debit) maps onto it directly, cleaner than
+    most other processors' abbreviation-heavy descriptions."""
+    upper = desc.upper()
+    if "INTERNATIONAL" in upper or "INTRA" in upper:
+        return "international"
+    is_corporate = "CORPORATE" in upper
+    is_credit = "CREDIT" in upper
+    is_debit = "DEBIT" in upper
+    if is_corporate and is_credit:
+        return "business_credit"
+    if is_corporate and is_debit:
+        return "business_debit"
+    if is_credit:
+        return "credit"
+    if is_debit:
+        return "debit"
+    return "unmapped"  # e.g. "Others" - a genuine catch-all on the statement itself
+
+
+NET_VOLUME_ROW = re.compile(r"^NET Processed volume, GBP\s+([\d,]+\.\d{2})")
+# The Deductions Summary uses singular "Total" - every other section on this
+# statement (A1, A2, A3, B, C, D) uses plural "Totals" - so this line is
+# unambiguous without needing section-anchoring, and already combines
+# Transactional + Recurring + Non-recurring + Other merchant fees (A+B+C+D)
+# in one figure - no need to re-sum the sub-sections.
+DEDUCTIONS_TOTAL_ROW = re.compile(r"^Total\s+(-?[\d,]+\.\d{2})\s*$")
+
+
+def parse_summary(lines):
+    """Turnover (NET Processed volume) and the true total fees from page 1's
+    Deductions Summary box."""
+    turnover = None
+    total_fees = None
+    for raw in lines:
+        line = raw.strip()
+        m = NET_VOLUME_ROW.match(line)
+        if m:
+            turnover = _f(m.group(1))
+            continue
+        m = DEDUCTIONS_TOTAL_ROW.match(line)
+        if m:
+            total_fees = _f(m.group(1))
+    return turnover, total_fees
 
 
 def parse_bcd_section(lines):
