@@ -335,16 +335,24 @@ def parse_service_charges(lines):
             continue
 
         # Chain-format fallback: same percentage row, but with no volume
-        # figure printed at all - capture rate + fee only, volume unknown.
+        # figure printed at all. Per Kos: since rate and fee are both
+        # known, the volume can be recovered as fee / rate - confirmed
+        # against a real Chain-format statement (Alternative Salon Ltd),
+        # where every back-calculated volume landed within a few pence of
+        # the statement's own Chain Summary By Card Type table (the small
+        # gap is expected rounding, since the fee itself is only printed
+        # to 2 decimal places before being divided back out).
         m = PCT_ROW_NO_VOLUME.match(line)
         if m:
             rate = float(m.group("rate"))
             fee = _f(m.group("fee"))
+            derived_volume = round(abs(fee) / rate, 2) if rate else None
             items.append({
                 "description": m.group("desc").strip(),
                 "row_type": "percentage_no_volume",
                 "rate": rate,
-                "volume": None,
+                "volume": derived_volume,
+                "volume_derived": derived_volume is not None,
                 "fee": fee,
                 "category": _categorize(m.group("desc").strip()),
                 "scale_flag": None,

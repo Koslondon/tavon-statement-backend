@@ -22,8 +22,23 @@ import re
 RATE_ROW = re.compile(
     r"^(?P<desc>.+?)\s+(?P<rate>\.\d+)\s+(?:\w+\s+)?RATE TIMES\s+(?P<volume>[\d,]+\.\d{2})\s+(?P<fee>-?[\d,]+\.\d{2})\s*$"
 )
+# Chain-format fallback: same rate-based fee, but no volume printed at all -
+# confirmed on a real Alternative Salon Ltd statement's "VISA INT
+# ACCEPTANCE FEE .004500 RATE TIMES   -0.36" line. Per Kos: recoverable as
+# fee / rate, same principle as clover.py's PCT_ROW_NO_VOLUME.
+RATE_ROW_NO_VOLUME = re.compile(
+    r"^(?P<desc>.+?)\s+(?P<rate>\.\d+)\s+(?:\w+\s+)?RATE(?:\s+TIMES)?\s+(?P<fee>-?[\d,]+\.\d{2})\s*$"
+)
 PER_TXN_ROW = re.compile(
     r"^(?P<desc>.+?)\s+(?P<count>\d+)\s+TRANSACTIONS? AT\s+(?P<rate>\.\d+)\s+(?P<fee>-?[\d,]+\.\d{2})\s*$"
+)
+# Chain-format fallback: same per-transaction fee, but the per-transaction
+# rate itself isn't printed at all (only the count and the total fee) -
+# confirmed on a real Alternative Salon Ltd statement's "AUTHORISATION
+# REQUEST 194 TRANSACTIONS AT   -9.66" line. Per Kos: recoverable as
+# fee / count.
+PER_TXN_ROW_NO_RATE = re.compile(
+    r"^(?P<desc>.+?)\s+(?P<count>\d+)\s+TRANSACTIONS? AT\s+(?P<fee>-?[\d,]+\.\d{2})\s*$"
 )
 TRANS_TOTALING_ROW = re.compile(
     r"^(?P<desc>.+?)\s+(?P<count>\d+)\s+TRANS TOTALING\s+(?P<volume>[\d,]+\.\d{2})\s+(?P<fee>-?[\d,]+\.\d{2})\s*$"
@@ -103,6 +118,22 @@ def parse_fees(lines):
             })
             continue
 
+        m = RATE_ROW_NO_VOLUME.match(line)
+        if m:
+            rate = float(m.group("rate"))
+            fee = _f(m.group("fee"))
+            derived_volume = round(abs(fee) / rate, 2) if rate else None
+            items.append({
+                "description": m.group("desc").strip(),
+                "row_type": "percentage",
+                "rate": rate,
+                "volume": derived_volume,
+                "volume_derived": derived_volume is not None,
+                "fee": fee,
+                "scale_flag": None,
+            })
+            continue
+
         m = PER_TXN_ROW.match(line)
         if m:
             items.append({
@@ -111,6 +142,20 @@ def parse_fees(lines):
                 "count": int(m.group("count")),
                 "per_txn_rate": float(m.group("rate")),
                 "fee": _f(m.group("fee")),
+            })
+            continue
+
+        m = PER_TXN_ROW_NO_RATE.match(line)
+        if m:
+            count = int(m.group("count"))
+            fee = _f(m.group("fee"))
+            items.append({
+                "description": m.group("desc").strip(),
+                "row_type": "per_transaction",
+                "count": count,
+                "per_txn_rate": round(abs(fee) / count, 4) if count else None,
+                "per_txn_rate_derived": True,
+                "fee": fee,
             })
             continue
 
