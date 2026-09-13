@@ -21,7 +21,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 
-from app.parsers import aib, clover, clover_fees, elavon, global_payments, intercard, dojo, trust_payments as trustpay
+from app.parsers import aib, clover, clover_fees, elavon, global_payments, intercard, dojo, trust_payments as trustpay, dna_payments
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("statement-checker")
@@ -74,6 +74,7 @@ PROCESSOR_SIGNATURES = [
     ("global_payments", re.compile(r"Global Payments|GPUK")),
     ("dojo", re.compile(r"Paymentsense Limited")),
     ("trust_payments", re.compile(r"trustpayments\.com|support@trustpayments")),
+    ("dna_payments", re.compile(r"DNA Payments Limited")),
 ]
 
 
@@ -161,6 +162,29 @@ def run_parser(processor: str, text: str) -> dict:
             "service_charges": charge_items, "service_charges_stated": charge_stated,
             "fees": fee_items, "fees_stated": fee_stated,
             "true_total_fees": round(true_total, 2),
+            "true_blended_rate_pct": true_blended_rate,
+        }
+
+    if processor == "dna_payments":
+        turnover, deductions_total = dna_payments.parse_summary(lines)
+        items, a2_stated = dna_payments.parse_a2_by_type(lines)
+        # Prefer the Deductions Summary total (already combines Transactional
+        # + Recurring + Non-recurring + Other merchant fees) over the A2
+        # table's own total, which only covers Transactional fees - on this
+        # statement they're equal since B/C/D are all zero, but that won't
+        # always be true.
+        true_total = deductions_total if deductions_total is not None else (
+            a2_stated["total"] if a2_stated else sum(i["total"] for i in items))
+        true_blended_rate = (
+            round(abs(true_total) / turnover * 100, 4) if turnover else None
+        )
+        transaction_count = a2_stated["count"] if a2_stated else None
+        return {
+            "processor": "DNA Payments",
+            "turnover": turnover,
+            "transaction_count": transaction_count,
+            "rows": items,
+            "true_total_fees": round(true_total, 2) if true_total is not None else None,
             "true_blended_rate_pct": true_blended_rate,
         }
 
