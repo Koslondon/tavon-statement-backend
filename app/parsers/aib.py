@@ -30,6 +30,15 @@ import re
 
 # Substring match against the 4-line wrap joined together, since the exact
 # line-break position shifts a little between Mastercard/Visa rows.
+#
+# KNOWN GAP (checked 2026-09, per Kos): this only covers the 2x2 matrix
+# actually observed on the one real statement checked (Adamson Doors) -
+# Commercial/Consumer x Debit/Credit. That statement had zero international
+# transactions, so it's genuinely unknown whether AIB's MSC table has a
+# distinguishable international row type at all, or folds it silently into
+# one of these four categories with no visible marker. Needs a real AIB
+# statement that actually contains international transactions before this
+# can be fixed properly - do not guess a keyword here without one.
 KEYWORD_CATEGORY = [
     ("Commercial Debit", "business_debit"),
     ("Commercial Credit", "business_credit"),

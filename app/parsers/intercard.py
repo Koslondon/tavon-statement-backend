@@ -37,6 +37,13 @@ CODE_INFO = {
     "VDMSF": ("Visa Debit service fee", "debit"),
     "VDTRX": ("Visa Debit transaction fee", "debit"),
 }
+# KNOWN GAP (checked 2026-09, per Kos): no international code appears
+# anywhere in this table. The one real statement checked (Acantha Crystals)
+# has zero international transactions, so it's genuinely unknown what an
+# international line's code would even look like here - could be a code
+# not yet seen at all, per InterCard's own fee schedule. Needs a real
+# InterCard statement that actually contains international transactions
+# before this can be fixed properly - do not guess a code here without one.
 
 PCT_ROW = re.compile(
     r"^(?P<desc>.+?)\s{2,}(?P<code>[A-Z]{4,6})\s{2,}"

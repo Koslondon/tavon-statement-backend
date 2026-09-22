@@ -237,6 +237,43 @@ def parse_simple_fee_table(lines, section_header):
     return items, stated
 
 
+def _categorize_row(region, desc):
+    """Classifies a single card-sales row into the same taxonomy used
+    across every other processor (debit, credit, business_debit,
+    business_credit, international).
+
+    The `region` field ("Domestic" / "Inter" / "Intra") is real, confirmed
+    data straight from the statement's own row structure - "Inter" is
+    Trust Payments' own term for international, and takes priority over
+    any business/consumer signal, matching how Elavon/Clover/Dojo treat
+    NON-EEA rows: Tavon's buy rates only have one international rate
+    regardless of the underlying card's business/consumer status.
+
+    The business/consumer split below follows the same keyword-matching
+    approach already proven on Elavon, Dojo and Global Payments, but
+    UNLIKE those, hasn't yet been confirmed against a real Trust Payments
+    description string - no real "business"/"commercial"-labelled row was
+    available to check this against when this was written. Treat the
+    international detection as solid; treat business_credit/business_debit
+    from this function as a reasonable best guess pending that check.
+    """
+    if region == "Inter":
+        return "international"
+    upper = desc.upper()
+    is_business = any(k in upper for k in ("BUSINESS", "COMMERCIAL", "CORPORATE", "PURCHASING"))
+    is_debit = "DEBIT" in upper
+    is_credit = "CREDIT" in upper
+    if is_business and is_debit:
+        return "business_debit"
+    if is_business and is_credit:
+        return "business_credit"
+    if is_debit:
+        return "debit"
+    if is_credit:
+        return "credit"
+    return "unmapped"
+
+
 def parse_statement(raw_text):
     lines = raw_text.splitlines()
     summary = parse_summary(lines)
@@ -244,6 +281,14 @@ def parse_statement(raw_text):
     visa_items, visa_total = parse_card_sales_table(lines, "Visa Sales")
     mc_items, mc_total = parse_card_sales_table(lines, "Mastercard Sales")
     ancillary_items, ancillary_total = parse_simple_fee_table(lines, "Ancillary Services & Fees")
+
+    for item in visa_items + mc_items:
+        item["category"] = _categorize_row(item["region"], item["description"])
+
+    all_card_items = visa_items + mc_items
+    total_gross = sum(i["gross"] for i in all_card_items) or None
+    international_volume = sum(i["gross"] for i in all_card_items if i["category"] == "international")
+    business_volume = sum(i["gross"] for i in all_card_items if i["category"] in ("business_debit", "business_credit"))
 
     true_processing_fees = round(
         (visa_total["trx_fees"] + visa_total["ic"] + visa_total["csf"] if visa_total else 0)
@@ -256,4 +301,7 @@ def parse_statement(raw_text):
         "mastercard_sales": mc_items, "mastercard_sales_stated": mc_total,
         "ancillary": ancillary_items, "ancillary_stated": ancillary_total,
         "true_processing_fees_total": true_processing_fees,
+        "turnover": total_gross,
+        "international_volume": round(international_volume, 2),
+        "business_volume": round(business_volume, 2),
     }
