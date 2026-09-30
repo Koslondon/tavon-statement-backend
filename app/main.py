@@ -15,10 +15,15 @@ import re
 import subprocess
 import tempfile
 import logging
+import asyncio
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 
+import httpx
 import resend
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, Field
 
 from app.parsers import aib, clover, clover_fees, elavon, global_payments, intercard, dojo, trust_payments as trustpay, dna_payments
@@ -38,6 +43,21 @@ EMAIL_FROM = os.environ.get("EMAIL_FROM", "Tavon Partners <statements@tavonpartn
 # Where "Quote me better price" lead notifications land - defaults to
 # Tavon's own inbox, overridable via env var without a code change.
 LEAD_NOTIFY_EMAIL = os.environ.get("LEAD_NOTIFY_EMAIL", "tavonpartners@gmail.com")
+
+# Google Contacts OAuth — the client credentials from the "Tavon Contacts"
+# OAuth client in Google Cloud Console. Tokens themselves are never kept
+# here (this whole service is built to persist nothing — see the module
+# docstring); they're written straight to Supabase instead, using the
+# service key below, which bypasses RLS the same way the Netlify
+# functions' service key does.
+GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
+GOOGLE_OAUTH_REDIRECT_URI = os.environ.get(
+    "GOOGLE_OAUTH_REDIRECT_URI", "https://tavon-statement-backend.onrender.com/oauth/google/callback"
+)
+PORTAL_URL = os.environ.get("PORTAL_URL", "https://tavonpartners.com/portal.html")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
 app = FastAPI(title="Tavon Partners Statement Checker")
 
@@ -549,3 +569,515 @@ async def notify_lead(req: LeadNotifyRequest):
         raise HTTPException(502, "Could not send that notification right now.")
 
     return {"sent": True}
+
+
+# ── Google Contacts OAuth ──────────────────────────────────────────
+#
+# This is the connection handshake only — it gets a Google account
+# authorized and its tokens safely stored in Supabase. The actual sync
+# logic (pushing/pulling contacts, polling, conflict resolution, the
+# "Tavon Clients" label, dedup) is a separate, larger piece of work
+# that builds on top of this once the connection itself is confirmed
+# solid — deliberately not rushed into the same change as the OAuth
+# plumbing, since a bug in a sync engine can quietly duplicate or lose
+# real client data in a way a bug here cannot.
+#
+# Security note: this service has no login system of its own, so
+# /oauth/google/start isn't gated by a session check here. It's safe
+# regardless, for two independent reasons: (1) the link is only ever
+# surfaced inside the admin-only Communication/Account area of the
+# portal, and (2) while the Google Cloud OAuth consent screen stays in
+# "Testing" status, Google itself refuses to let anyone complete this
+# flow except the specific test user configured there
+# (tavonpartners@gmail.com) — an attacker who found this URL would be
+# stopped by Google's own consent screen before ever reaching the
+# callback below.
+
+def _supabase_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+@app.get("/oauth/google/start")
+async def google_oauth_start():
+    if not GOOGLE_OAUTH_CLIENT_ID:
+        raise HTTPException(500, "Google OAuth is not configured yet - GOOGLE_OAUTH_CLIENT_ID is not set.")
+    params = {
+        "client_id": GOOGLE_OAUTH_CLIENT_ID,
+        "redirect_uri": GOOGLE_OAUTH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "https://www.googleapis.com/auth/contacts email",
+        "access_type": "offline",
+        # Forces the consent screen every time, which guarantees Google
+        # actually returns a refresh_token — it otherwise only does
+        # that on an account's very first authorization ever.
+        "prompt": "consent",
+    }
+    query = urlencode(params)
+    return RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{query}")
+
+
+@app.get("/oauth/google/callback")
+async def google_oauth_callback(code: str | None = None, error: str | None = None):
+    if error:
+        return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason={error}")
+    if not code:
+        return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason=no_code")
+    if not (GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET and SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        log.error("google_oauth_callback: server not fully configured")
+        return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason=not_configured")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            token_res = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": GOOGLE_OAUTH_CLIENT_ID,
+                    "client_secret": GOOGLE_OAUTH_CLIENT_SECRET,
+                    "redirect_uri": GOOGLE_OAUTH_REDIRECT_URI,
+                    "grant_type": "authorization_code",
+                },
+            )
+            token_res.raise_for_status()
+            tokens = token_res.json()
+        except Exception as exc:  # noqa: BLE001 - never log the code/tokens themselves
+            log.warning("google_oauth_callback: token exchange failed: %s", type(exc).__name__)
+            return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason=token_exchange_failed")
+
+        access_token = tokens.get("access_token")
+        refresh_token = tokens.get("refresh_token")
+        expires_in = tokens.get("expires_in", 3600)
+        if not access_token or not refresh_token:
+            # No refresh_token usually means prompt=consent didn't force a
+            # fresh grant - shouldn't happen given how /start builds the
+            # URL, but fail loudly rather than store a half-working token.
+            log.error("google_oauth_callback: token response missing access_token or refresh_token")
+            return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason=incomplete_token_response")
+
+        try:
+            userinfo_res = await client.get(
+                "https://www.googleapis.com/oauth2/v2/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            userinfo_res.raise_for_status()
+            google_email = userinfo_res.json().get("email")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("google_oauth_callback: userinfo lookup failed: %s", type(exc).__name__)
+            return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason=userinfo_failed")
+
+        if not google_email:
+            return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason=no_email")
+
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+
+        try:
+            upsert_res = await client.post(
+                f"{SUPABASE_URL}/rest/v1/tavon_google_oauth_tokens",
+                headers={**_supabase_headers(), "Prefer": "resolution=merge-duplicates"},
+                json={
+                    "google_email": google_email,
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "expires_at": expires_at,
+                },
+                params={"on_conflict": "google_email"},
+            )
+            upsert_res.raise_for_status()
+        except Exception as exc:  # noqa: BLE001 - never log token values
+            log.error("google_oauth_callback: failed to store tokens in Supabase: %s", type(exc).__name__)
+            return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason=storage_failed")
+
+    return RedirectResponse(f"{PORTAL_URL}?gcontacts=connected&email={google_email}")
+
+
+@app.get("/oauth/google/status")
+async def google_oauth_status():
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return {"connected": False}
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            res = await client.get(
+                f"{SUPABASE_URL}/rest/v1/tavon_google_oauth_tokens",
+                headers=_supabase_headers(),
+                params={"select": "google_email,connected_at,updated_at", "limit": "1"},
+            )
+            res.raise_for_status()
+            rows = res.json()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("google_oauth_status: lookup failed: %s", type(exc).__name__)
+            return {"connected": False}
+    if not rows:
+        return {"connected": False}
+    row = rows[0]
+    return {"connected": True, "google_email": row.get("google_email"), "connected_at": row.get("connected_at")}
+
+
+# ── Google Contacts — the actual bidirectional sync ─────────────────
+#
+# Design (per Kos):
+#   - The app is the master record. App -> Google -> iPhone (native
+#     Google-account contact sync on the phone).
+#   - App -> Google: every create/edit of a Tavon contact pushes to
+#     Google under a "Tavon Clients" contact group.
+#   - Google -> App: polled every ~15 minutes using a sync token
+#     (incremental, not a full re-fetch each time). A genuinely newer
+#     edit on Google's side updates the Tavon record; a tie or an
+#     older Google edit leaves the app's version alone — the app wins.
+#   - A person added straight on the phone, with no matching Tavon
+#     contact yet, is created here flagged needs_review=true (the
+#     "Unsorted" bucket) rather than silently merged into anything.
+#   - Deleting in the app deletes on Google too. Deleting on Google is
+#     only ever flagged (deleted_on_google=true) here, never
+#     auto-deletes the Tavon row — that decision stays a human one.
+#   - Dedup is by Google's own resourceName, stored on the Tavon row.
+
+PEOPLE_API = "https://people.googleapis.com/v1"
+PERSON_FIELDS = "names,phoneNumbers,emailAddresses,organizations,metadata"
+
+
+async def _get_token_row(client: "httpx.AsyncClient") -> dict | None:
+    res = await client.get(
+        f"{SUPABASE_URL}/rest/v1/tavon_google_oauth_tokens",
+        headers=_supabase_headers(),
+        params={"select": "*", "limit": "1"},
+    )
+    res.raise_for_status()
+    rows = res.json()
+    return rows[0] if rows else None
+
+
+async def get_valid_access_token(client: "httpx.AsyncClient") -> tuple[str, dict] | tuple[None, None]:
+    """Returns a usable access token for the connected Google account,
+    refreshing it first if it's expired or close to it. Returns
+    (access_token, token_row) or (None, None) if nothing is connected."""
+    row = await _get_token_row(client)
+    if not row:
+        return None, None
+    expires_at = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+    if expires_at > datetime.now(timezone.utc) + timedelta(minutes=2):
+        return row["access_token"], row
+    try:
+        refresh_res = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_OAUTH_CLIENT_ID,
+                "client_secret": GOOGLE_OAUTH_CLIENT_SECRET,
+                "refresh_token": row["refresh_token"],
+                "grant_type": "refresh_token",
+            },
+        )
+        refresh_res.raise_for_status()
+        tokens = refresh_res.json()
+    except Exception as exc:  # noqa: BLE001 - never log token values
+        log.error("get_valid_access_token: refresh failed: %s", type(exc).__name__)
+        return None, None
+    new_access_token = tokens.get("access_token")
+    new_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=tokens.get("expires_in", 3600))).isoformat()
+    row["access_token"] = new_access_token
+    row["expires_at"] = new_expires_at
+    try:
+        await client.patch(
+            f"{SUPABASE_URL}/rest/v1/tavon_google_oauth_tokens",
+            headers=_supabase_headers(),
+            params={"id": f"eq.{row['id']}"},
+            json={"access_token": new_access_token, "expires_at": new_expires_at, "updated_at": datetime.now(timezone.utc).isoformat()},
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("get_valid_access_token: could not persist refreshed token: %s", type(exc).__name__)
+    return new_access_token, row
+
+
+async def ensure_tavon_clients_group(client: "httpx.AsyncClient", access_token: str, token_row: dict) -> str | None:
+    """Returns the 'Tavon Clients' contact group's resourceName, creating
+    it on Google the first time and caching it on the token row after."""
+    if token_row.get("contact_group_resource_name"):
+        return token_row["contact_group_resource_name"]
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        list_res = await client.get(f"{PEOPLE_API}/contactGroups", headers=headers, params={"pageSize": 200})
+        list_res.raise_for_status()
+        for group in list_res.json().get("contactGroups", []):
+            if group.get("name") == "Tavon Clients":
+                resource_name = group["resourceName"]
+                break
+        else:
+            create_res = await client.post(
+                f"{PEOPLE_API}/contactGroups", headers=headers, json={"contactGroup": {"name": "Tavon Clients"}}
+            )
+            create_res.raise_for_status()
+            resource_name = create_res.json()["resourceName"]
+    except Exception as exc:  # noqa: BLE001
+        log.error("ensure_tavon_clients_group: failed: %s", type(exc).__name__)
+        return None
+    try:
+        await client.patch(
+            f"{SUPABASE_URL}/rest/v1/tavon_google_oauth_tokens",
+            headers=_supabase_headers(),
+            params={"id": f"eq.{token_row['id']}"},
+            json={"contact_group_resource_name": resource_name},
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ensure_tavon_clients_group: could not cache resourceName: %s", type(exc).__name__)
+    return resource_name
+
+
+def _person_body_from_contact(contact: dict) -> dict:
+    body: dict = {}
+    if contact.get("first_name") or contact.get("last_name"):
+        body["names"] = [{"givenName": contact.get("first_name") or "", "familyName": contact.get("last_name") or ""}]
+    if contact.get("phone"):
+        body["phoneNumbers"] = [{"value": contact["phone"], "type": "mobile"}]
+    if contact.get("email"):
+        body["emailAddresses"] = [{"value": contact["email"]}]
+    if contact.get("company"):
+        body["organizations"] = [{"name": contact["company"]}]
+    return body
+
+
+class ContactPushRequest(BaseModel):
+    id: str
+    first_name: str | None = None
+    last_name: str | None = None
+    company: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    google_resource_name: str | None = None
+
+
+@app.post("/contacts/push")
+async def push_contact(req: ContactPushRequest):
+    """Called by the portal right after a Tavon contact is created or
+    updated. Best-effort by design — a Google outage shouldn't block
+    saving a contact in the app, so failures here are reported but
+    never meant to be treated as fatal by the caller."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        access_token, token_row = await get_valid_access_token(client)
+        if not access_token:
+            raise HTTPException(409, "Google Contacts isn't connected yet.")
+        group_resource_name = await ensure_tavon_clients_group(client, access_token, token_row)
+        headers = {"Authorization": f"Bearer {access_token}"}
+        body = _person_body_from_contact(req.model_dump())
+
+        try:
+            if req.google_resource_name:
+                get_res = await client.get(
+                    f"{PEOPLE_API}/{req.google_resource_name}", headers=headers, params={"personFields": "metadata"}
+                )
+                get_res.raise_for_status()
+                body["etag"] = get_res.json()["etag"]
+                update_fields = ",".join(k for k in ("names", "phoneNumbers", "emailAddresses", "organizations") if k in body)
+                res = await client.patch(
+                    f"{PEOPLE_API}/{req.google_resource_name}:updateContact",
+                    headers=headers,
+                    params={"updatePersonFields": update_fields or "names"},
+                    json=body,
+                )
+                res.raise_for_status()
+                resource_name = req.google_resource_name
+            else:
+                if group_resource_name:
+                    body["memberships"] = [{"contactGroupMembership": {"contactGroupResourceName": group_resource_name}}]
+                res = await client.post(f"{PEOPLE_API}/people:createContact", headers=headers, json=body)
+                res.raise_for_status()
+                resource_name = res.json()["resourceName"]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("push_contact: Google API call failed: %s", type(exc).__name__)
+            raise HTTPException(502, "Could not sync this contact to Google right now.")
+
+        try:
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/tavon_contacts",
+                headers=_supabase_headers(),
+                params={"id": f"eq.{req.id}"},
+                json={"google_resource_name": resource_name, "google_updated_at": datetime.now(timezone.utc).isoformat()},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("push_contact: could not record resourceName in Supabase: %s", type(exc).__name__)
+
+    return {"synced": True, "google_resource_name": resource_name}
+
+
+@app.post("/contacts/delete")
+async def delete_contact(google_resource_name: str):
+    """Called by the portal when a Tavon contact is deleted, so the
+    deletion follows through to Google too."""
+    if not google_resource_name:
+        return {"deleted": False, "reason": "no_resource_name"}
+    async with httpx.AsyncClient(timeout=15) as client:
+        access_token, _ = await get_valid_access_token(client)
+        if not access_token:
+            raise HTTPException(409, "Google Contacts isn't connected yet.")
+        try:
+            res = await client.delete(
+                f"{PEOPLE_API}/{google_resource_name}:deleteContact",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if res.status_code not in (200, 404):
+                res.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("delete_contact: Google API call failed: %s", type(exc).__name__)
+            raise HTTPException(502, "Could not delete this contact on Google right now.")
+    return {"deleted": True}
+
+
+def _contact_from_person(person: dict) -> dict:
+    names = person.get("names") or [{}]
+    phones = person.get("phoneNumbers") or [{}]
+    emails = person.get("emailAddresses") or [{}]
+    orgs = person.get("organizations") or [{}]
+    return {
+        "first_name": names[0].get("givenName", ""),
+        "last_name": names[0].get("familyName", ""),
+        "phone": phones[0].get("value"),
+        "email": emails[0].get("value"),
+        "company": orgs[0].get("name"),
+    }
+
+
+async def run_contacts_pull():
+    """The Google -> App half of the sync. Safe to call repeatedly —
+    it's a no-op if nothing's connected, and picks up from wherever the
+    stored sync token left off."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        access_token, token_row = await get_valid_access_token(client)
+        if not access_token:
+            return
+        headers = {"Authorization": f"Bearer {access_token}"}
+        sync_token = token_row.get("people_sync_token")
+        params = {"personFields": PERSON_FIELDS, "requestSyncToken": "true", "pageSize": "200"}
+        if sync_token:
+            params["syncToken"] = sync_token
+
+        page_token = None
+        next_sync_token = None
+        connections: list[dict] = []
+        try:
+            while True:
+                request_params = dict(params)
+                if page_token:
+                    request_params["pageToken"] = page_token
+                res = await client.get(f"{PEOPLE_API}/people/me/connections", headers=headers, params=request_params)
+                if res.status_code == 410:
+                    # Sync token expired on Google's side - drop it and do
+                    # a fresh full sync on the next run rather than fail.
+                    log.warning("run_contacts_pull: sync token expired, clearing for a fresh full sync next time")
+                    await client.patch(
+                        f"{SUPABASE_URL}/rest/v1/tavon_google_oauth_tokens",
+                        headers=_supabase_headers(),
+                        params={"id": f"eq.{token_row['id']}"},
+                        json={"people_sync_token": None},
+                    )
+                    return
+                res.raise_for_status()
+                data = res.json()
+                connections.extend(data.get("connections", []))
+                next_sync_token = data.get("nextSyncToken", next_sync_token)
+                page_token = data.get("nextPageToken")
+                if not page_token:
+                    break
+        except Exception as exc:  # noqa: BLE001
+            log.warning("run_contacts_pull: fetching connections failed: %s", type(exc).__name__)
+            return
+
+        for person in connections:
+            resource_name = person.get("resourceName")
+            if not resource_name:
+                continue
+            try:
+                match_res = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/tavon_contacts",
+                    headers=_supabase_headers(),
+                    params={"google_resource_name": f"eq.{resource_name}", "select": "id,updated_at", "limit": "1"},
+                )
+                match_res.raise_for_status()
+                matches = match_res.json()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("run_contacts_pull: lookup failed for one contact: %s", type(exc).__name__)
+                continue
+
+            deleted = person.get("metadata", {}).get("deleted", False)
+
+            if matches:
+                contact_id = matches[0]["id"]
+                if deleted:
+                    await client.patch(
+                        f"{SUPABASE_URL}/rest/v1/tavon_contacts",
+                        headers=_supabase_headers(),
+                        params={"id": f"eq.{contact_id}"},
+                        json={"deleted_on_google": True},
+                    )
+                    continue
+                # Conflict rule: only apply Google's version if it's
+                # genuinely newer than the app's own last update — a tie
+                # or an older Google edit leaves the app's version alone.
+                sources = person.get("metadata", {}).get("sources", [{}])
+                google_updated = sources[0].get("updateTime")
+                app_updated = matches[0].get("updated_at")
+                if google_updated and app_updated and google_updated <= app_updated:
+                    continue
+                patch = _contact_from_person(person)
+                patch["google_updated_at"] = google_updated
+                await client.patch(
+                    f"{SUPABASE_URL}/rest/v1/tavon_contacts",
+                    headers=_supabase_headers(),
+                    params={"id": f"eq.{contact_id}"},
+                    json=patch,
+                )
+            elif not deleted:
+                # No Tavon match at all - a contact added straight on the
+                # phone. Lands as Unsorted for a human to review, rather
+                # than being assumed to belong to any lead or deal.
+                new_contact = _contact_from_person(person)
+                if not new_contact.get("first_name") and not new_contact.get("phone") and not new_contact.get("email"):
+                    continue
+                new_contact.update({
+                    "google_resource_name": resource_name,
+                    "origin": "google",
+                    "needs_review": True,
+                    "status": "lead",
+                })
+                await client.post(
+                    f"{SUPABASE_URL}/rest/v1/tavon_contacts", headers=_supabase_headers(), json=new_contact
+                )
+
+        if next_sync_token:
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/tavon_google_oauth_tokens",
+                headers=_supabase_headers(),
+                params={"id": f"eq.{token_row['id']}"},
+                json={"people_sync_token": next_sync_token},
+            )
+
+
+async def _contacts_polling_loop():
+    # Runs for as long as this process is alive. On Render's paid
+    # "always on" tiers that's continuous; on a tier that spins down
+    # between requests, this loop pauses along with the rest of the
+    # process and picks back up (via the sync token) once a request
+    # wakes it again - it will not silently miss changes, just delay
+    # noticing them until the service is next awake.
+    while True:
+        try:
+            await run_contacts_pull()
+        except Exception as exc:  # noqa: BLE001
+            log.error("contacts polling loop: unexpected error: %s", type(exc).__name__)
+        await asyncio.sleep(900)  # 15 minutes
+
+
+@app.on_event("startup")
+async def _start_contacts_polling():
+    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+        asyncio.create_task(_contacts_polling_loop())
+
+
+@app.post("/contacts/pull-now")
+async def pull_now():
+    """Manual trigger for testing the Google -> App pull without
+    waiting for the 15-minute loop - not linked from the portal UI,
+    call directly while verifying the sync works."""
+    await run_contacts_pull()
+    return {"ran": True}
