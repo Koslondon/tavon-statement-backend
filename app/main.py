@@ -576,7 +576,7 @@ async def notify_lead(req: LeadNotifyRequest):
 # This is the connection handshake only — it gets a Google account
 # authorized and its tokens safely stored in Supabase. The actual sync
 # logic (pushing/pulling contacts, polling, conflict resolution, the
-# "Tavon Clients" label, dedup) is a separate, larger piece of work
+# "Tavon Partners TP" label, dedup) is a separate, larger piece of work
 # that builds on top of this once the connection itself is confirmed
 # solid — deliberately not rushed into the same change as the OAuth
 # plumbing, since a bug in a sync engine can quietly duplicate or lose
@@ -722,10 +722,14 @@ async def google_oauth_status():
 #   - The app is the master record. App -> Google -> iPhone (native
 #     Google-account contact sync on the phone).
 #   - App -> Google: every create/edit of a Tavon contact pushes to
-#     Google under a "Tavon Clients" contact group.
-#   - Google -> App: polled every ~15 minutes using a sync token
-#     (incremental, not a full re-fetch each time). A genuinely newer
-#     edit on Google's side updates the Tavon record; a tie or an
+#     Google under the "Tavon Partners TP" contact group — the real
+#     group Kos had already built, not a separate one this sync
+#     invented.
+#   - Google -> App: polled every ~15 minutes, scoped strictly to that
+#     group's members — nothing else in the account is ever fetched or
+#     touched, so a personal contact sitting elsewhere in the same
+#     Google account is completely invisible to this sync. A genuinely
+#     newer edit on Google's side updates the Tavon record; a tie or an
 #     older Google edit leaves the app's version alone — the app wins.
 #   - A person added straight on the phone, with no matching Tavon
 #     contact yet, is created here flagged needs_review=true (the
@@ -736,6 +740,13 @@ async def google_oauth_status():
 #   - Dedup is by Google's own resourceName, stored on the Tavon row.
 
 PEOPLE_API = "https://people.googleapis.com/v1"
+# The real, existing Google Contacts label — Kos built this himself
+# with 900+ real business contacts already in it, long before this
+# sync existed. Pushing new contacts here (rather than creating a
+# separate "Tavon Clients" group) and scoping the pull to only this
+# group's members is what keeps personal contacts elsewhere in the
+# same account completely untouched by the sync.
+TAVON_GROUP_NAME = "Tavon Partners TP"
 PERSON_FIELDS = "names,phoneNumbers,emailAddresses,organizations,metadata"
 
 
@@ -792,8 +803,9 @@ async def get_valid_access_token(client: "httpx.AsyncClient") -> tuple[str, dict
 
 
 async def ensure_tavon_clients_group(client: "httpx.AsyncClient", access_token: str, token_row: dict) -> str | None:
-    """Returns the 'Tavon Clients' contact group's resourceName, creating
-    it on Google the first time and caching it on the token row after."""
+    """Returns the resourceName of the existing "Tavon Partners TP" group,
+    only creating one (with that same name) in the rare case it's ever
+    missing. Cached on the token row after the first lookup."""
     if token_row.get("contact_group_resource_name"):
         return token_row["contact_group_resource_name"]
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -801,12 +813,12 @@ async def ensure_tavon_clients_group(client: "httpx.AsyncClient", access_token: 
         list_res = await client.get(f"{PEOPLE_API}/contactGroups", headers=headers, params={"pageSize": 200})
         list_res.raise_for_status()
         for group in list_res.json().get("contactGroups", []):
-            if group.get("name") == "Tavon Clients":
+            if group.get("name") == TAVON_GROUP_NAME:
                 resource_name = group["resourceName"]
                 break
         else:
             create_res = await client.post(
-                f"{PEOPLE_API}/contactGroups", headers=headers, json={"contactGroup": {"name": "Tavon Clients"}}
+                f"{PEOPLE_API}/contactGroups", headers=headers, json={"contactGroup": {"name": TAVON_GROUP_NAME}}
             )
             create_res.raise_for_status()
             resource_name = create_res.json()["resourceName"]
@@ -939,51 +951,53 @@ def _contact_from_person(person: dict) -> dict:
 
 
 async def run_contacts_pull():
-    """The Google -> App half of the sync. Safe to call repeatedly —
-    it's a no-op if nothing's connected, and picks up from wherever the
-    stored sync token left off."""
+    """The Google -> App half of the sync. Scoped strictly to members of
+    the "Tavon Partners TP" group — anything else in the account (a
+    personal contact, say) is never even fetched, let alone touched.
+    Safe to call repeatedly; a no-op if nothing's connected."""
     async with httpx.AsyncClient(timeout=30) as client:
         access_token, token_row = await get_valid_access_token(client)
         if not access_token:
             return
         headers = {"Authorization": f"Bearer {access_token}"}
-        sync_token = token_row.get("people_sync_token")
-        params = {"personFields": PERSON_FIELDS, "requestSyncToken": "true", "pageSize": "200"}
-        if sync_token:
-            params["syncToken"] = sync_token
-
-        page_token = None
-        next_sync_token = None
-        connections: list[dict] = []
-        try:
-            while True:
-                request_params = dict(params)
-                if page_token:
-                    request_params["pageToken"] = page_token
-                res = await client.get(f"{PEOPLE_API}/people/me/connections", headers=headers, params=request_params)
-                if res.status_code == 410:
-                    # Sync token expired on Google's side - drop it and do
-                    # a fresh full sync on the next run rather than fail.
-                    log.warning("run_contacts_pull: sync token expired, clearing for a fresh full sync next time")
-                    await client.patch(
-                        f"{SUPABASE_URL}/rest/v1/tavon_google_oauth_tokens",
-                        headers=_supabase_headers(),
-                        params={"id": f"eq.{token_row['id']}"},
-                        json={"people_sync_token": None},
-                    )
-                    return
-                res.raise_for_status()
-                data = res.json()
-                connections.extend(data.get("connections", []))
-                next_sync_token = data.get("nextSyncToken", next_sync_token)
-                page_token = data.get("nextPageToken")
-                if not page_token:
-                    break
-        except Exception as exc:  # noqa: BLE001
-            log.warning("run_contacts_pull: fetching connections failed: %s", type(exc).__name__)
+        group_resource_name = await ensure_tavon_clients_group(client, access_token, token_row)
+        if not group_resource_name:
             return
 
-        for person in connections:
+        try:
+            group_res = await client.get(
+                f"{PEOPLE_API}/{group_resource_name}", headers=headers, params={"maxMembers": 10000}
+            )
+            group_res.raise_for_status()
+            member_resource_names = group_res.json().get("memberResourceNames", [])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("run_contacts_pull: could not list group members: %s", type(exc).__name__)
+            return
+
+        # Batch-fetch full details for exactly those members, 200 at a
+        # time (the API's own limit per batchGet call) — never the
+        # whole account.
+        people: list[dict] = []
+        for i in range(0, len(member_resource_names), 200):
+            chunk = member_resource_names[i:i + 200]
+            try:
+                batch_res = await client.get(
+                    f"{PEOPLE_API}/people:batchGet",
+                    headers=headers,
+                    params=[("resourceNames", r) for r in chunk] + [("personFields", PERSON_FIELDS)],
+                )
+                batch_res.raise_for_status()
+                for item in batch_res.json().get("responses", []):
+                    person = item.get("person")
+                    if person:
+                        people.append(person)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("run_contacts_pull: batchGet failed for one chunk: %s", type(exc).__name__)
+                continue
+
+        fetched_resource_names = {p.get("resourceName") for p in people if p.get("resourceName")}
+
+        for person in people:
             resource_name = person.get("resourceName")
             if not resource_name:
                 continue
@@ -999,18 +1013,8 @@ async def run_contacts_pull():
                 log.warning("run_contacts_pull: lookup failed for one contact: %s", type(exc).__name__)
                 continue
 
-            deleted = person.get("metadata", {}).get("deleted", False)
-
             if matches:
                 contact_id = matches[0]["id"]
-                if deleted:
-                    await client.patch(
-                        f"{SUPABASE_URL}/rest/v1/tavon_contacts",
-                        headers=_supabase_headers(),
-                        params={"id": f"eq.{contact_id}"},
-                        json={"deleted_on_google": True},
-                    )
-                    continue
                 # Conflict rule: only apply Google's version if it's
                 # genuinely newer than the app's own last update — a tie
                 # or an older Google edit leaves the app's version alone.
@@ -1027,10 +1031,12 @@ async def run_contacts_pull():
                     params={"id": f"eq.{contact_id}"},
                     json=patch,
                 )
-            elif not deleted:
-                # No Tavon match at all - a contact added straight on the
-                # phone. Lands as Unsorted for a human to review, rather
-                # than being assumed to belong to any lead or deal.
+            else:
+                # No Tavon match at all - a contact already in this group
+                # (or added straight on the phone, into this same group)
+                # with no linked Tavon record yet. Lands as Unsorted for
+                # a human to review, rather than being assumed to belong
+                # to any particular lead or deal.
                 new_contact = _contact_from_person(person)
                 if not new_contact.get("first_name") and not new_contact.get("phone") and not new_contact.get("email"):
                     continue
@@ -1044,22 +1050,38 @@ async def run_contacts_pull():
                     f"{SUPABASE_URL}/rest/v1/tavon_contacts", headers=_supabase_headers(), json=new_contact
                 )
 
-        if next_sync_token:
-            await client.patch(
-                f"{SUPABASE_URL}/rest/v1/tavon_google_oauth_tokens",
+        # Anything Tavon still thinks is linked to Google, but that no
+        # longer shows up in this run's group member list, has either
+        # been deleted on Google's side or removed from the group —
+        # either way, flag it rather than silently keep treating it as
+        # connected, and never auto-delete the Tavon record itself.
+        try:
+            linked_res = await client.get(
+                f"{SUPABASE_URL}/rest/v1/tavon_contacts",
                 headers=_supabase_headers(),
-                params={"id": f"eq.{token_row['id']}"},
-                json={"people_sync_token": next_sync_token},
+                params={"google_resource_name": "not.is.null", "deleted_on_google": "eq.false", "select": "id,google_resource_name"},
             )
+            linked_res.raise_for_status()
+            for row in linked_res.json():
+                if row["google_resource_name"] not in fetched_resource_names:
+                    await client.patch(
+                        f"{SUPABASE_URL}/rest/v1/tavon_contacts",
+                        headers=_supabase_headers(),
+                        params={"id": f"eq.{row['id']}"},
+                        json={"deleted_on_google": True},
+                    )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("run_contacts_pull: removal-detection pass failed: %s", type(exc).__name__)
 
 
 async def _contacts_polling_loop():
     # Runs for as long as this process is alive. On Render's paid
     # "always on" tiers that's continuous; on a tier that spins down
     # between requests, this loop pauses along with the rest of the
-    # process and picks back up (via the sync token) once a request
-    # wakes it again - it will not silently miss changes, just delay
-    # noticing them until the service is next awake.
+    # process and simply resumes once a request wakes it again — each
+    # run re-checks the Tavon group fresh (it's scoped small enough
+    # that this is cheap), so nothing needs to be resumed from a saved
+    # position, just delayed until the service is next awake.
     while True:
         try:
             await run_contacts_pull()
