@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, Field
 
-from app.parsers import aib, clover, clover_fees, elavon, global_payments, intercard, dojo, trust_payments as trustpay, dna_payments
+from app.parsers import aib, clover, clover_fees, elavon, global_payments, intercard, dojo, trust_payments as trustpay, dna_payments, evo
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("statement-checker")
@@ -95,6 +95,7 @@ PROCESSOR_SIGNATURES = [
     ("dojo", re.compile(r"Paymentsense Limited")),
     ("trust_payments", re.compile(r"trustpayments\.com|support@trustpayments")),
     ("dna_payments", re.compile(r"DNA Payments Limited")),
+    ("evo", re.compile(r"EVO Payments International|evopayments\.com")),
 ]
 
 
@@ -206,6 +207,31 @@ def run_parser(processor: str, text: str) -> dict:
             "rows": items,
             "true_total_fees": round(true_total, 2) if true_total is not None else None,
             "true_blended_rate_pct": true_blended_rate,
+        }
+
+    if processor == "evo":
+        result = evo.parse_evo_statement(text)
+        turnover = result["turnover"]
+        true_total = result["true_total_fees"]
+        # Never stated directly anywhere on this statement - computed
+        # exactly as Kos described: true total fees over turnover.
+        true_blended_rate = (
+            round(true_total / turnover * 100, 4) if turnover and true_total is not None else None
+        )
+        return {
+            "processor": "EVO Payments International",
+            "turnover": turnover,
+            "total_msc": result["total_msc"],
+            "other_fees": result["other_fees"],
+            "true_total_fees": true_total,
+            "true_blended_rate_pct": true_blended_rate,
+            "transaction_count": result["transaction_count"],
+            "rows": result["rows"],
+            # Amex is billed separately by Amex directly - no EVO fee
+            # applies, so it's surfaced only for the mix breakdown, not
+            # folded into the blended rate above.
+            "amex_turnover": result["amex_turnover"],
+            "amex_transaction_count": result["amex_transaction_count"],
         }
 
     if processor == "elavon":
