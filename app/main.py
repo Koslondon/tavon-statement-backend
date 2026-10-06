@@ -701,15 +701,20 @@ async def google_oauth_callback(code: str | None = None, error: str | None = Non
         expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
 
         try:
+            token_payload = {
+                "google_email": google_email,
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "expires_at": expires_at,
+            }
+            # The connection must belong to a company, or the database refuses it.
+            tenant_id = await _default_tenant_id(client)
+            if tenant_id:
+                token_payload["tenant_id"] = tenant_id
             upsert_res = await client.post(
                 f"{SUPABASE_URL}/rest/v1/tavon_google_oauth_tokens",
                 headers={**_supabase_headers(), "Prefer": "resolution=merge-duplicates"},
-                json={
-                    "google_email": google_email,
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                    "expires_at": expires_at,
-                },
+                json=token_payload,
                 params={"on_conflict": "google_email"},
             )
             upsert_res.raise_for_status()
@@ -774,6 +779,31 @@ PEOPLE_API = "https://people.googleapis.com/v1"
 # same account completely untouched by the sync.
 TAVON_GROUP_NAME = "Tavon Partners TP"
 PERSON_FIELDS = "names,phoneNumbers,emailAddresses,organizations,metadata"
+
+
+async def _default_tenant_id(client: "httpx.AsyncClient") -> str | None:
+    """The company a Google connection belongs to.
+
+    The "connect Google" link doesn't say who clicked it, so a connection belongs
+    to the OLDEST company (the original one) - the same rule the portal's own
+    functions use when nothing else says. Every contact saved and every
+    connection stored must belong to a company: since the portal became
+    multi-company, a row with no company is refused (connections) or silently
+    invisible to everyone (contacts). Returns None on the old single-company
+    database, which has no companies table - there nothing needs attaching.
+    """
+    try:
+        res = await client.get(
+            f"{SUPABASE_URL}/rest/v1/tavon_tenants",
+            headers=_supabase_headers(),
+            params={"select": "id", "order": "created_at.asc", "limit": "1"},
+        )
+        res.raise_for_status()
+        rows = res.json()
+        return rows[0]["id"] if rows else None
+    except Exception as exc:  # noqa: BLE001
+        log.info("_default_tenant_id: no companies table or lookup failed (%s) - treating as single-company", type(exc).__name__)
+        return None
 
 
 async def _get_token_row(client: "httpx.AsyncClient") -> dict | None:
@@ -1023,6 +1053,11 @@ async def run_contacts_pull():
 
         fetched_resource_names = {p.get("resourceName") for p in people if p.get("resourceName")}
 
+        # Every contact saved must belong to this connection's company, or nobody
+        # can ever see it (the portal only shows a company its own contacts).
+        tenant_id = (token_row or {}).get("tenant_id") or await _default_tenant_id(client)
+        summary = {"created": 0, "updated": 0, "adopted": 0, "failed": 0}
+
         for person in people:
             resource_name = person.get("resourceName")
             if not resource_name:
@@ -1031,11 +1066,12 @@ async def run_contacts_pull():
                 match_res = await client.get(
                     f"{SUPABASE_URL}/rest/v1/tavon_contacts",
                     headers=_supabase_headers(),
-                    params={"google_resource_name": f"eq.{resource_name}", "select": "id,updated_at", "limit": "1"},
+                    params={"google_resource_name": f"eq.{resource_name}", "select": "id,updated_at,tenant_id", "limit": "1"},
                 )
                 match_res.raise_for_status()
                 matches = match_res.json()
             except Exception as exc:  # noqa: BLE001
+                summary["failed"] += 1
                 log.warning("run_contacts_pull: lookup failed for one contact: %s", type(exc).__name__)
                 continue
 
@@ -1047,16 +1083,27 @@ async def run_contacts_pull():
                 sources = person.get("metadata", {}).get("sources", [{}])
                 google_updated = sources[0].get("updateTime")
                 app_updated = matches[0].get("updated_at")
-                if google_updated and app_updated and google_updated <= app_updated:
+                # A contact saved before this was fixed has NO company, so nobody
+                # can see it. It is claimed now, whether or not Google changed it.
+                orphan = bool(tenant_id) and matches[0].get("tenant_id") is None
+                if google_updated and app_updated and google_updated <= app_updated and not orphan:
                     continue
                 patch = _contact_from_person(person)
                 patch["google_updated_at"] = google_updated
-                await client.patch(
-                    f"{SUPABASE_URL}/rest/v1/tavon_contacts",
-                    headers=_supabase_headers(),
-                    params={"id": f"eq.{contact_id}"},
-                    json=patch,
-                )
+                if orphan:
+                    patch["tenant_id"] = tenant_id
+                try:
+                    upd = await client.patch(
+                        f"{SUPABASE_URL}/rest/v1/tavon_contacts",
+                        headers=_supabase_headers(),
+                        params={"id": f"eq.{contact_id}"},
+                        json=patch,
+                    )
+                    upd.raise_for_status()
+                    summary["adopted" if orphan else "updated"] += 1
+                except Exception as exc:  # noqa: BLE001
+                    summary["failed"] += 1
+                    log.warning("run_contacts_pull: could not update one contact: %s", type(exc).__name__)
             else:
                 # No Tavon match at all - a contact already in this group
                 # (or added straight on the phone, into this same group)
@@ -1072,20 +1119,32 @@ async def run_contacts_pull():
                     "needs_review": True,
                     "status": "lead",
                 })
-                await client.post(
-                    f"{SUPABASE_URL}/rest/v1/tavon_contacts", headers=_supabase_headers(), json=new_contact
-                )
+                if tenant_id:
+                    new_contact["tenant_id"] = tenant_id
+                try:
+                    ins = await client.post(
+                        f"{SUPABASE_URL}/rest/v1/tavon_contacts", headers=_supabase_headers(), json=new_contact
+                    )
+                    ins.raise_for_status()
+                    summary["created"] += 1
+                except Exception as exc:  # noqa: BLE001 - never log the contact itself
+                    summary["failed"] += 1
+                    log.warning("run_contacts_pull: could not save one new contact: %s", type(exc).__name__)
 
         # Anything Tavon still thinks is linked to Google, but that no
         # longer shows up in this run's group member list, has either
         # been deleted on Google's side or removed from the group —
         # either way, flag it rather than silently keep treating it as
         # connected, and never auto-delete the Tavon record itself.
+        # Stays inside this connection's company.
         try:
             linked_res = await client.get(
                 f"{SUPABASE_URL}/rest/v1/tavon_contacts",
                 headers=_supabase_headers(),
-                params={"google_resource_name": "not.is.null", "deleted_on_google": "eq.false", "select": "id,google_resource_name"},
+                params={
+                    "google_resource_name": "not.is.null", "deleted_on_google": "eq.false", "select": "id,google_resource_name",
+                    **({"tenant_id": f"eq.{tenant_id}"} if tenant_id else {}),
+                },
             )
             linked_res.raise_for_status()
             for row in linked_res.json():
@@ -1098,6 +1157,8 @@ async def run_contacts_pull():
                     )
         except Exception as exc:  # noqa: BLE001
             log.warning("run_contacts_pull: removal-detection pass failed: %s", type(exc).__name__)
+        log.info("run_contacts_pull: %s contacts in the Google group; %s", len(people), summary)
+        return summary
 
 
 async def _contacts_polling_loop():
@@ -1127,5 +1188,5 @@ async def pull_now():
     """Manual trigger for testing the Google -> App pull without
     waiting for the 15-minute loop - not linked from the portal UI,
     call directly while verifying the sync works."""
-    await run_contacts_pull()
-    return {"ran": True}
+    summary = await run_contacts_pull()
+    return {"ran": True, "summary": summary}
