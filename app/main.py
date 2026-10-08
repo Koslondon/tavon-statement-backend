@@ -18,12 +18,14 @@ import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode, quote
+import time
+import hmac
 
 import httpx
 import resend
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel, EmailStr, Field
 
 from app.parsers import aib, clover, clover_fees, elavon, global_payments, intercard, dojo, trust_payments as trustpay, dna_payments, evo
@@ -81,13 +83,59 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
 app = FastAPI(title="Tavon Partners Statement Checker")
 
+# ---------------------------------------------------------------------------
+# Abuse protection. In-memory per-address hourly limits (this service runs as
+# one instance and persists nothing, so a restart simply resets the counts).
+# Registered BEFORE the CORS middleware below so that even a "too many
+# requests" reply carries the CORS headers and the website can show its
+# message window instead of a bare network error.
+# ---------------------------------------------------------------------------
+_RATE_RULES = [  # (path prefix, max requests per hour per address)
+    ("/analyze", 30), ("/email-report", 10), ("/notify-lead", 10),
+    ("/contacts/", 600), ("/oauth/", 120),
+]
+_rate_hits: dict[tuple[str, str], list[float]] = {}
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+@app.middleware("http")
+async def _rate_limit(request: Request, call_next):
+    if request.method != "OPTIONS":
+        for prefix, limit in _RATE_RULES:
+            if request.url.path.startswith(prefix):
+                now = time.time()
+                key = (_client_ip(request), prefix)
+                hits = [t for t in _rate_hits.get(key, []) if now - t < 3600]
+                if len(hits) >= limit:
+                    retry = max(1, int(3600 - (now - hits[0])))
+                    _rate_hits[key] = hits
+                    log.warning("rate limit hit on %s", prefix)
+                    return JSONResponse(
+                        {"error": "Too many requests. Please wait a while and try again.", "code": "rate_limited", "retry_after": retry},
+                        status_code=429, headers={"Retry-After": str(retry)},
+                    )
+                hits.append(now)
+                _rate_hits[key] = hits
+                if len(_rate_hits) > 5000:  # keep memory bounded
+                    for k in [k for k, v in _rate_hits.items() if not v or now - v[-1] > 3600]:
+                        _rate_hits.pop(k, None)
+                break
+    return await call_next(request)
+
+
 # Locked to the real domains (apex and www, since either can be what the
 # browser sends as Origin depending on how a visitor reaches the site):
 # Tavon Partners, plus any added through EXTRA_ALLOWED_ORIGINS.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["POST"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -647,6 +695,47 @@ def _supabase_headers():
     }
 
 
+# ---------------------------------------------------------------------------
+# Who may call the Google-contacts endpoints. The portal sends the signed-in
+# person's token; we check it with Supabase and that they are active staff.
+# REQUIRE_AUTH is OFF by default so existing portals that don't send a token
+# yet keep working (calls without a valid token are logged as warnings).
+# Set REQUIRE_AUTH=true on Render once every portal sends the token.
+# ---------------------------------------------------------------------------
+REQUIRE_AUTH = os.environ.get("REQUIRE_AUTH", "").strip().lower() in ("1", "true", "yes")
+PULL_NOW_KEY = os.environ.get("PULL_NOW_KEY", "")
+
+
+async def require_staff(request: Request, what: str) -> dict | None:
+    def fail(code: int, msg: str):
+        if REQUIRE_AUTH:
+            raise HTTPException(code, msg)
+        log.warning("unauthenticated call to %s (REQUIRE_AUTH is off, allowed)", what)
+        return None
+
+    auth_header = request.headers.get("authorization", "")
+    token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
+    if not token or not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return fail(401, "Please sign in again.")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            ures = await client.get(f"{SUPABASE_URL}/auth/v1/user",
+                                    headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {token}"})
+            if ures.status_code != 200:
+                return fail(401, "Please sign in again.")
+            uid = ures.json().get("id")
+            sres = await client.get(f"{SUPABASE_URL}/rest/v1/tavon_staff", headers=_supabase_headers(),
+                                    params={"select": "tenant_id,deactivated_at", "user_id": f"eq.{uid}", "limit": "1"})
+            rows = sres.json() if sres.status_code == 200 else []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("require_staff: lookup failed: %s", type(exc).__name__)
+        return fail(401, "Could not check your sign-in.")
+    if not rows or rows[0].get("deactivated_at"):
+        return fail(403, "Not allowed.")
+    return {"user_id": uid, "tenant_id": rows[0].get("tenant_id")}
+
+
+
 @app.get("/oauth/google/start")
 async def google_oauth_start(origin: str | None = None):
     if not GOOGLE_OAUTH_CLIENT_ID:
@@ -749,7 +838,8 @@ async def google_oauth_callback(code: str | None = None, error: str | None = Non
 
 
 @app.get("/oauth/google/status")
-async def google_oauth_status():
+async def google_oauth_status(request: Request):
+    await require_staff(request, "/oauth/google/status")
     if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
         return {"connected": False}
     async with httpx.AsyncClient(timeout=10) as client:
@@ -940,12 +1030,19 @@ class ContactPushRequest(BaseModel):
 
 
 @app.post("/contacts/push")
-async def push_contact(req: ContactPushRequest):
+async def push_contact(req: ContactPushRequest, request: Request):
     """Called by the portal right after a Tavon contact is created or
     updated. Best-effort by design — a Google outage shouldn't block
     saving a contact in the app, so failures here are reported but
     never meant to be treated as fatal by the caller."""
+    staff = await require_staff(request, "/contacts/push")
     async with httpx.AsyncClient(timeout=15) as client:
+        if staff and staff.get("tenant_id") and req.id:
+            own = await client.get(f"{SUPABASE_URL}/rest/v1/tavon_contacts", headers=_supabase_headers(),
+                                   params={"select": "tenant_id", "id": f"eq.{req.id}", "limit": "1"})
+            orows = own.json() if own.status_code == 200 else []
+            if orows and orows[0].get("tenant_id") not in (None, staff["tenant_id"]):
+                raise HTTPException(403, "Not allowed.")
         access_token, token_row = await get_valid_access_token(client)
         if not access_token:
             raise HTTPException(409, "Google Contacts isn't connected yet.")
@@ -993,9 +1090,10 @@ async def push_contact(req: ContactPushRequest):
 
 
 @app.post("/contacts/delete")
-async def delete_contact(google_resource_name: str):
+async def delete_contact(google_resource_name: str, request: Request):
     """Called by the portal when a Tavon contact is deleted, so the
     deletion follows through to Google too."""
+    await require_staff(request, "/contacts/delete")
     if not google_resource_name:
         return {"deleted": False, "reason": "no_resource_name"}
     async with httpx.AsyncClient(timeout=15) as client:
@@ -1207,7 +1305,9 @@ async def _start_contacts_polling():
 
 
 @app.post("/contacts/pull-now")
-async def pull_now():
+async def pull_now(request: Request):
+    if not PULL_NOW_KEY or not hmac.compare_digest(request.headers.get("x-admin-key", ""), PULL_NOW_KEY):
+        raise HTTPException(403, "Not allowed.")
     """Manual trigger for testing the Google -> App pull without
     waiting for the 15-minute loop - not linked from the portal UI,
     call directly while verifying the sync works."""
