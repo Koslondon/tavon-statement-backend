@@ -155,6 +155,35 @@ def parse_rate_breakdown(lines):
     return items, stated
 
 
+def _categorize(desc):
+    """Classify a rate-breakdown row into Tavon's 5-category buy-rate
+    model, from its description text. Confirmed real example (Mba Best
+    Jul 2024): "Mastercard Corporate and Purchasing, International" -
+    the literal word "International" does appear in real description
+    text on this statement, alongside business-card wording ("Corporate",
+    "Purchasing"). International takes priority when both signals are
+    present in the same row, matching how Elavon/Clover treat NON-EEA
+    rows - Tavon's buy rates only have one international rate regardless
+    of the underlying card's business/consumer status. "EEA" is included
+    defensively (Dojo's own rate-type comment groups "International/EEA
+    rows" together) but wasn't independently confirmed as literal
+    description text the way "International" was.
+    """
+    upper = desc.upper()
+    if "INTERNATIONAL" in upper or "EEA" in upper:
+        return "international"
+    is_business = any(k in upper for k in ("BUSINESS", "CORPORATE", "PURCHASING", "COMMERCIAL"))
+    is_debit = "DEBIT" in upper
+    is_credit = "CREDIT" in upper
+    if is_business:
+        return "business_debit" if is_debit else "business_credit"
+    if is_debit:
+        return "debit"
+    if is_credit:
+        return "credit"
+    return "unmapped"
+
+
 def _row_from_match(m, desc_override=None):
     rate_str = m.group("rate")
     pct_match = re.match(r"^([\d.]+)%", rate_str)
@@ -164,6 +193,7 @@ def _row_from_match(m, desc_override=None):
     desc = (desc_override if desc_override is not None else m.group("desc")).strip()
     return {
         "description": desc,
+        "category": _categorize(desc),
         "count": int(m.group("count").replace(",", "")),
         "volume": _f(m.group("volume")),
         "rate_display": rate_str,
