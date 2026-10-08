@@ -17,7 +17,7 @@ import tempfile
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 
 import httpx
 import resend
@@ -56,17 +56,37 @@ GOOGLE_OAUTH_REDIRECT_URI = os.environ.get(
     "GOOGLE_OAUTH_REDIRECT_URI", "https://tavon-statement-backend.onrender.com/oauth/google/callback"
 )
 PORTAL_URL = os.environ.get("PORTAL_URL", "https://tavonpartners.com/portal.html")
+
+
+def _allowed_origins() -> list[str]:
+    """The websites allowed to call this service: the two Tavon Partners addresses, plus any others listed
+    (comma-separated) in the EXTRA_ALLOWED_ORIGINS setting, e.g. "https://tavons.com,https://www.tavons.com".
+    Only plain https addresses count: no wildcards, no paths, nothing insecure."""
+    out = ["https://tavonpartners.com", "https://www.tavonpartners.com"]
+    for raw in os.environ.get("EXTRA_ALLOWED_ORIGINS", "").split(","):
+        o = raw.strip().rstrip("/")
+        if re.fullmatch(r"https://[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+", o) and o not in out:
+            out.append(o)
+    return out
+
+
+ALLOWED_ORIGINS = _allowed_origins()
+
+
+def _portal_url_for(origin: str | None) -> str:
+    """Where to send someone back to after Google: the site they started from if it is an allowed one, else the default."""
+    return f"{origin}/portal.html" if origin and origin in ALLOWED_ORIGINS else PORTAL_URL
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
 app = FastAPI(title="Tavon Partners Statement Checker")
 
-# Locked to the real Tavon Partners domain (both apex and www, since
-# either can be what the browser sends as Origin depending on how a
-# visitor reaches the site).
+# Locked to the real domains (apex and www, since either can be what the
+# browser sends as Origin depending on how a visitor reaches the site):
+# Tavon Partners, plus any added through EXTRA_ALLOWED_ORIGINS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://tavonpartners.com", "https://www.tavonpartners.com"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["POST"],
     allow_headers=["*"],
 )
@@ -628,7 +648,7 @@ def _supabase_headers():
 
 
 @app.get("/oauth/google/start")
-async def google_oauth_start():
+async def google_oauth_start(origin: str | None = None):
     if not GOOGLE_OAUTH_CLIENT_ID:
         raise HTTPException(500, "Google OAuth is not configured yet - GOOGLE_OAUTH_CLIENT_ID is not set.")
     params = {
@@ -642,19 +662,22 @@ async def google_oauth_start():
         # that on an account's very first authorization ever.
         "prompt": "consent",
     }
+    if origin and origin in ALLOWED_ORIGINS:
+        params["state"] = origin          # handed back by Google, so the person returns to the site they came from
     query = urlencode(params)
     return RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{query}")
 
 
 @app.get("/oauth/google/callback")
-async def google_oauth_callback(code: str | None = None, error: str | None = None):
+async def google_oauth_callback(code: str | None = None, error: str | None = None, state: str | None = None):
+    portal = _portal_url_for(state)
     if error:
-        return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason={error}")
+        return RedirectResponse(f"{portal}?gcontacts=error&reason={quote(str(error), safe='')}")
     if not code:
-        return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason=no_code")
+        return RedirectResponse(f"{portal}?gcontacts=error&reason=no_code")
     if not (GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET and SUPABASE_URL and SUPABASE_SERVICE_KEY):
         log.error("google_oauth_callback: server not fully configured")
-        return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason=not_configured")
+        return RedirectResponse(f"{portal}?gcontacts=error&reason=not_configured")
 
     async with httpx.AsyncClient(timeout=15) as client:
         try:
@@ -672,7 +695,7 @@ async def google_oauth_callback(code: str | None = None, error: str | None = Non
             tokens = token_res.json()
         except Exception as exc:  # noqa: BLE001 - never log the code/tokens themselves
             log.warning("google_oauth_callback: token exchange failed: %s", type(exc).__name__)
-            return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason=token_exchange_failed")
+            return RedirectResponse(f"{portal}?gcontacts=error&reason=token_exchange_failed")
 
         access_token = tokens.get("access_token")
         refresh_token = tokens.get("refresh_token")
@@ -682,7 +705,7 @@ async def google_oauth_callback(code: str | None = None, error: str | None = Non
             # fresh grant - shouldn't happen given how /start builds the
             # URL, but fail loudly rather than store a half-working token.
             log.error("google_oauth_callback: token response missing access_token or refresh_token")
-            return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason=incomplete_token_response")
+            return RedirectResponse(f"{portal}?gcontacts=error&reason=incomplete_token_response")
 
         try:
             userinfo_res = await client.get(
@@ -693,10 +716,10 @@ async def google_oauth_callback(code: str | None = None, error: str | None = Non
             google_email = userinfo_res.json().get("email")
         except Exception as exc:  # noqa: BLE001
             log.warning("google_oauth_callback: userinfo lookup failed: %s", type(exc).__name__)
-            return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason=userinfo_failed")
+            return RedirectResponse(f"{portal}?gcontacts=error&reason=userinfo_failed")
 
         if not google_email:
-            return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason=no_email")
+            return RedirectResponse(f"{portal}?gcontacts=error&reason=no_email")
 
         expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
 
@@ -720,9 +743,9 @@ async def google_oauth_callback(code: str | None = None, error: str | None = Non
             upsert_res.raise_for_status()
         except Exception as exc:  # noqa: BLE001 - never log token values
             log.error("google_oauth_callback: failed to store tokens in Supabase: %s", type(exc).__name__)
-            return RedirectResponse(f"{PORTAL_URL}?gcontacts=error&reason=storage_failed")
+            return RedirectResponse(f"{portal}?gcontacts=error&reason=storage_failed")
 
-    return RedirectResponse(f"{PORTAL_URL}?gcontacts=connected&email={google_email}")
+    return RedirectResponse(f"{portal}?gcontacts=connected&email={google_email}")
 
 
 @app.get("/oauth/google/status")
