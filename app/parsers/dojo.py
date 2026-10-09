@@ -242,23 +242,99 @@ def parse_flat_fee_table(lines, section_header):
     return items, stated_total
 
 
+def parse_additional_rates(lines):
+    """The "Additional rates" table (newer template): surcharges charged as
+    a percentage of turnover on top of the card-type rates - e.g. "Remote"
+    (customer-not-present / card-not-present) at 0.50%. Same row shape as
+    the main rate table. Anchored on the bare header line so the summary
+    line at the top of page 1 ("Additional rates   £136.53") is not
+    mistaken for it."""
+    items = []
+    stated = None
+    in_section = False
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if not in_section:
+            if line == "Additional rates":
+                in_section = True
+            continue
+        close = re.match(r"^Total\s+(?:(?P<count>\d[\d,]*)\s+£(?P<volume>[\d,]+\.\d{2})\s+)?£(?P<total>[\d,]+\.\d{2})\s*$", line)
+        if close:
+            stated = _f(close.group("total"))
+            break
+        m = RATE_ROW.match(line)
+        if m:
+            desc = m.group("desc").strip()
+            row = _row_from_match(m)
+            row.pop("category", None)  # surcharge, not a card type - keep it out of the card-mix harvest
+            row["kind"] = "remote" if re.search(r"remote|not present|cnp|moto|online|ecom", desc, re.I) else "surcharge"
+            items.append(row)
+    return items, stated
+
+
 def parse_statement(raw_text):
     """Top-level entry point: returns everything reconciled together."""
     lines = raw_text.splitlines()
     summary = parse_summary(lines)
     rate_items, rate_stated = parse_rate_breakdown(lines)
+    add_items, add_stated = parse_additional_rates(lines)
+    txn_fee_items, txn_fee_stated = parse_flat_fee_table(lines, "Card transaction fees")
+    svc_items, svc_stated = parse_flat_fee_table(lines, "Card machine & account services")
 
     rate_computed_total = round(sum(i["total"] for i in rate_items), 2)
     rate_computed_volume = round(sum(i["volume"] for i in rate_items), 2)
-    true_blended_rate = (
+    card_rate_only_pct = (
         round(rate_computed_total / rate_computed_volume * 100, 4)
         if rate_computed_volume else None
     )
+
+    # Turnover and transaction count: the rate table's own closing line is
+    # the statement's authoritative figure; fall back to summing the rows.
+    turnover = (rate_stated or {}).get("volume") or rate_computed_volume or None
+    txn_count = (rate_stated or {}).get("count") or sum(i["count"] for i in rate_items) or None
+
+    additional_total = add_stated if add_stated is not None else round(sum(i["total"] for i in add_items), 2)
+
+    # True cost = everything Dojo takes: card rates + additional rates
+    # (e.g. remote / customer-not-present) + per-transaction fees + machine
+    # and account services + VAT. That is the invoice's own "Total due".
+    # If a template has no Total due line, add the parts up instead.
+    total_fees = summary.get("Total due")
+    if total_fees is None:
+        parts = [rate_computed_total, additional_total]
+        parts.append(txn_fee_stated if txn_fee_stated is not None else round(sum(i["total"] for i in txn_fee_items), 2))
+        parts.append(svc_stated if svc_stated is not None else round(sum(i["total"] for i in svc_items), 2))
+        parts.append(summary.get("VAT total", 0.0))
+        total_fees = round(sum(parts), 2)
+
+    true_blended_rate = (
+        round(total_fees / turnover * 100, 4) if turnover and total_fees is not None else card_rate_only_pct
+    )
+
+    remote = [i for i in add_items if i.get("kind") == "remote"]
+    cnp_volume = round(sum(i["volume"] for i in remote), 2) if remote else None
+    cnp_fee = round(sum(i["total"] for i in remote), 2) if remote else None
+    cnp_rate = remote[0]["percent_component"] if remote else None
 
     return {
         "summary": summary,
         "rate_breakdown": rate_items,
         "rate_breakdown_computed_total": rate_computed_total,
         "rate_breakdown_stated": rate_stated,
+        "additional_rates": add_items,
+        "additional_rates_total": additional_total,
+        "transaction_fees": txn_fee_items,
+        "account_services": svc_items,
+        # Top-level figures the portal and public checker read directly.
+        "turnover": turnover,
+        "transaction_count": txn_count,
+        "total_fees": total_fees,
+        "vat_total": summary.get("VAT total"),
+        "card_rate_only_pct": card_rate_only_pct,
         "true_blended_rate_pct": true_blended_rate,
+        "cnp_volume": cnp_volume,
+        "cnp_rate_pct": cnp_rate,
+        "cnp_fee": cnp_fee,
     }
