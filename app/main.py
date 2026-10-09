@@ -30,8 +30,60 @@ from pydantic import BaseModel, EmailStr, Field
 
 from app.parsers import aib, clover, clover_fees, elavon, global_payments, intercard, dojo, trust_payments as trustpay, dna_payments, evo
 
-logging.basicConfig(level=logging.INFO)
+import contextvars
+import json as _json
+import secrets as _secrets
+import base64 as _b64
+
+# ---- structured logging: one JSON line per event, with request id + user id ----
+# Levels: debug (development; set LOG_LEVEL=debug), info (one line per request),
+# error (anything that breaks). The request id arrives from the browser as
+# X-Request-Id, so the same id appears in the Netlify functions' logs and in the
+# error log table. The user id is read from the sign-in token for labelling only.
+# No emails, tokens or statement contents are ever logged.
+_req_id = contextvars.ContextVar("req_id", default=None)
+_user_id = contextvars.ContextVar("user_id", default=None)
+_REDACT = [
+    (re.compile(r"eyJ[\w-]+\.[\w-]+\.[\w-]+"), "[jwt]"),
+    (re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "[email]"),
+    (re.compile(r"\b(?:sk|re|rk|pk|key)[_-][\w-]{16,}", re.I), "[key]"),
+    (re.compile(r"([?&](?:code|token|state|access_token)=)[^&\s]+", re.I), r"\1[x]"),
+]
+
+
+def _redact(text) -> str:
+    t = str(text)
+    for rx, rep in _REDACT:
+        t = rx.sub(rep, t)
+    return t[:600]
+
+
+class _JsonFormatter(logging.Formatter):
+    _LEVELS = {"DEBUG": "debug", "INFO": "info", "WARNING": "warn", "ERROR": "error", "CRITICAL": "error"}
+
+    def format(self, record):
+        out = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "level": self._LEVELS.get(record.levelname, "info"),
+            "svc": "statement-backend",
+            "req": _req_id.get(),
+            "user": _user_id.get(),
+        }
+        extra = getattr(record, "fields", None)
+        if extra:
+            out.update(extra)
+        msg = _redact(record.getMessage())
+        if record.exc_info:
+            msg += " | " + _redact("".join(__import__("traceback").format_exception(*record.exc_info))[-500:])
+        out["msg"] = msg
+        return _json.dumps(out, default=str)
+
+
+_h = logging.StreamHandler()
+_h.setFormatter(_JsonFormatter())
+logging.basicConfig(level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO), handlers=[_h], force=True)
 log = logging.getLogger("statement-checker")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # its URLs can carry ids; our own request line is enough
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5MB hard cap
 
@@ -129,6 +181,51 @@ async def _rate_limit(request: Request, call_next):
     return await call_next(request)
 
 
+def _jwt_sub(auth_header: str):
+    try:
+        tok = auth_header.split(" ", 1)[1] if auth_header.lower().startswith("bearer ") else ""
+        payload = tok.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        sub = _json.loads(_b64.urlsafe_b64decode(payload)).get("sub")
+        return sub if isinstance(sub, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", sub) else None
+    except Exception:
+        return None
+
+
+_REQ_ID_OK = re.compile(r"[A-Za-z0-9_-]{4,40}")
+
+
+@app.middleware("http")
+async def _request_log(request: Request, call_next):
+    rid = request.headers.get("x-request-id", "")
+    if not _REQ_ID_OK.fullmatch(rid):
+        rid = "r-" + _secrets.token_hex(4)
+    _req_id.set(rid)
+    _user_id.set(_jwt_sub(request.headers.get("authorization", "")))
+    t0 = time.time()
+    try:
+        response = await call_next(request)
+    except Exception:
+        ms = int((time.time() - t0) * 1000)
+        log.error("unhandled error on %s %s", request.method, request.url.path, exc_info=True,
+                  extra={"fields": {"status": 500, "ms": ms}})
+        return JSONResponse({"error": "Something went wrong. Please try again.", "ref": rid},
+                            status_code=500, headers={"X-Request-Id": rid})
+    ms = int((time.time() - t0) * 1000)
+    response.headers["X-Request-Id"] = rid
+    # Health pings are noise; log them only at debug level. Paths only - never query strings
+    # (the Google callback carries a one-time code in its query).
+    if request.url.path in ("/", "/health", "/healthz"):
+        level = logging.DEBUG
+    elif response.status_code >= 500:
+        level = logging.ERROR
+    else:
+        level = logging.INFO
+    log.log(level, "%s %s", request.method, request.url.path,
+            extra={"fields": {"status": response.status_code, "ms": ms}})
+    return response
+
+
 # Locked to the real domains (apex and www, since either can be what the
 # browser sends as Origin depending on how a visitor reaches the site):
 # Tavon Partners, plus any added through EXTRA_ALLOWED_ORIGINS.
@@ -137,6 +234,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
+    expose_headers=["X-Request-Id"],
 )
 
 
